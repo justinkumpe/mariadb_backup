@@ -614,7 +614,7 @@ class MariaDBManager:
         all_backups.sort(key=lambda x: x["mtime"], reverse=True)
 
         for idx, backup in enumerate(all_backups, 1):
-            backup_time = datetime.fromtimestamp(backup["mtime"])
+            backup_time = datetime.datetime.fromtimestamp(backup["mtime"])
             size = sum(
                 os.path.getsize(os.path.join(backup["path"], f))
                 for f in os.listdir(backup["path"])
