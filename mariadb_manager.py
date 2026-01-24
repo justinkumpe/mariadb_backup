@@ -77,15 +77,32 @@ class MariaDBManager:
         if config is None:
             config = self.config
 
-        with open(self.config_file, "w") as f:
-            config.write(f)
-        os.chmod(self.config_file, 0o600)
+        # Get absolute path
+        abs_path = os.path.abspath(self.config_file)
         
-        # Debug: Verify file was written
-        if os.path.exists(self.config_file):
-            size = os.path.getsize(self.config_file)
-            return True
-        return False
+        # Debug output
+        print(f"  Saving to: {abs_path}")
+        print(f"  Sections to save: {config.sections()}")
+        
+        try:
+            with open(abs_path, "w") as f:
+                config.write(f)
+            os.chmod(abs_path, 0o600)
+            
+            # Verify file was written
+            if os.path.exists(abs_path):
+                size = os.path.getsize(abs_path)
+                print(f"  File written: {size} bytes")
+                
+                # Read back and verify
+                test_config = configparser.ConfigParser()
+                test_config.read(abs_path)
+                print(f"  Verification: {len(test_config.sections())} sections read back")
+                return True
+            return False
+        except Exception as e:
+            print(f"  ERROR during save: {e}")
+            return False
 
     def get_mysql_connection_args(self):
         """Get MySQL connection arguments"""
@@ -715,18 +732,25 @@ class MariaDBManager:
                 host = input(f"Host [{self.config['mysql']['host']}]: ").strip()
                 if host:
                     self.config.set('mysql', 'host', host)
+                    print(f"  → Set host to: {host}")
                 
                 port = input(f"Port [{self.config['mysql']['port']}]: ").strip()
                 if port:
                     self.config.set('mysql', 'port', port)
+                    print(f"  → Set port to: {port}")
                 
                 user = input(f"User [{self.config['mysql']['user']}]: ").strip()
                 if user:
                     self.config.set('mysql', 'user', user)
+                    print(f"  → Set user to: {user}")
                 
                 password = getpass.getpass("Password (leave empty to keep current): ")
                 if password:
                     self.config.set('mysql', 'password', password)
+                    print(f"  → Password updated")
+                
+                print(f"\n✓ Settings updated in memory (not saved yet)")
+
 
             elif choice == "2":
                 print("\n--- Backup Paths ---")
