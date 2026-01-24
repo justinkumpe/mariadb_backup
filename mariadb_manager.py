@@ -81,27 +81,61 @@ class MariaDBManager:
         abs_path = os.path.abspath(self.config_file)
         
         # Debug output
-        print(f"  Saving to: {abs_path}")
-        print(f"  Sections to save: {config.sections()}")
+        print(f"\n  [DEBUG] save_config() called")
+        print(f"  [DEBUG] Target file: {abs_path}")
+        print(f"  [DEBUG] File exists before write: {os.path.exists(abs_path)}")
+        print(f"  [DEBUG] Sections to save: {config.sections()}")
+        
+        # Show what we're about to save
+        print(f"  [DEBUG] Values being saved:")
+        for section in config.sections():
+            print(f"    [{section}]")
+            for key, value in config.items(section):
+                if key == 'password':
+                    print(f"      {key} = {'*' * len(value) if value else '(empty)'}")
+                else:
+                    print(f"      {key} = {value}")
         
         try:
+            # Write the file
             with open(abs_path, "w") as f:
                 config.write(f)
+            print(f"  [DEBUG] File write completed")
+            
+            # Set permissions
             os.chmod(abs_path, 0o600)
+            print(f"  [DEBUG] Permissions set to 600")
             
             # Verify file was written
             if os.path.exists(abs_path):
                 size = os.path.getsize(abs_path)
-                print(f"  File written: {size} bytes")
+                print(f"  [DEBUG] File verified: {size} bytes")
                 
-                # Read back and verify
+                # Read back first few lines to verify content
+                print(f"  [DEBUG] Reading back file contents:")
+                with open(abs_path, 'r') as f:
+                    lines = f.readlines()[:10]  # First 10 lines
+                    for line in lines:
+                        print(f"    {line.rstrip()}")
+                
+                # Try to parse it back
                 test_config = configparser.ConfigParser()
                 test_config.read(abs_path)
-                print(f"  Verification: {len(test_config.sections())} sections read back")
+                print(f"  [DEBUG] Parse verification: {len(test_config.sections())} sections")
+                
+                if test_config.has_section('mysql'):
+                    saved_host = test_config.get('mysql', 'host')
+                    print(f"  [DEBUG] Verified mysql.host = {saved_host}")
+                
                 return True
-            return False
+            else:
+                print(f"  [DEBUG] ERROR: File does not exist after write!")
+                return False
+                
         except Exception as e:
-            print(f"  ERROR during save: {e}")
+            print(f"  [DEBUG] EXCEPTION during save: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def get_mysql_connection_args(self):
@@ -792,7 +826,14 @@ class MariaDBManager:
 
             elif choice == "5":
                 print("\n--- Current Configuration ---")
-                print(f"Config file: {self.config_file}")
+                print(f"Config file: {os.path.abspath(self.config_file)}")
+                print(f"File exists: {os.path.exists(self.config_file)}")
+                if os.path.exists(self.config_file):
+                    print(f"File size: {os.path.getsize(self.config_file)} bytes")
+                    import datetime
+                    mtime = os.path.getmtime(self.config_file)
+                    print(f"Last modified: {datetime.datetime.fromtimestamp(mtime)}")
+                
                 print(f"\n[mysql]")
                 print(f"  host = {self.config['mysql']['host']}")
                 print(f"  port = {self.config['mysql']['port']}")
@@ -805,6 +846,9 @@ class MariaDBManager:
                 print(f"  monthly = {self.config['backup_paths']['monthly']}")
                 print(f"\n[options]")
                 print(f"  compression = {self.config['options'].get('compression', 'yes')}")
+                
+                print(f"\nPress Enter to continue...")
+                input()
 
             elif choice == "6":
                 if self.save_config():
