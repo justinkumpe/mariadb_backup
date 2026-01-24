@@ -1026,6 +1026,180 @@ class MariaDBManager:
                 print("\nExiting without saving.")
                 break
 
+    def manage_schedule(self):
+        """Manage automated backup schedule (cron)"""
+        print(f"\n{'='*60}")
+        print("Backup Schedule Management")
+        print(f"{'='*60}\n")
+        
+        # Get current crontab
+        try:
+            result = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
+            current_cron = result.stdout if result.returncode == 0 else ""
+        except Exception as e:
+            print(f"ERROR: Could not read crontab: {e}")
+            return
+        
+        # Check for existing MariaDB backup entries
+        mariadb_entries = []
+        other_entries = []
+        
+        for line in current_cron.split('\n'):
+            if 'mariadb_manager.py' in line or 'MariaDB' in line:
+                mariadb_entries.append(line)
+            elif line.strip():
+                other_entries.append(line)
+        
+        if mariadb_entries:
+            print("Current MariaDB backup schedule:")
+            print("-" * 60)
+            for entry in mariadb_entries:
+                print(entry)
+            print("-" * 60)
+            print()
+        else:
+            print("No automated backups currently scheduled.")
+            print()
+        
+        print("Options:")
+        print("  1. Add/Update schedule")
+        print("  2. Remove all MariaDB backup schedules")
+        print("  3. View full crontab")
+        print("  0. Back to main menu")
+        
+        choice = input("\nSelect option: ").strip()
+        
+        if choice == "1":
+            print("\nSelect backup schedule:")
+            print("  1. Hourly + Daily + Monthly (recommended)")
+            print("  2. Daily only")
+            print("  3. Daily + Monthly")
+            print("  4. Custom")
+            
+            schedule_choice = input("\nOption (1-4): ").strip()
+            
+            script_path = os.path.abspath(sys.argv[0])
+            config_path = os.path.abspath(self.config_file)
+            
+            new_entries = []
+            
+            if schedule_choice == "1":
+                new_entries = [
+                    "# MariaDB Hourly Backup",
+                    f"0 * * * * {script_path} --backup hourly --config {config_path} >> /var/log/mariadb_backup.log 2>&1",
+                    "",
+                    "# MariaDB Daily Backup (2 AM)",
+                    f"0 2 * * * {script_path} --backup daily --config {config_path} >> /var/log/mariadb_backup.log 2>&1",
+                    "",
+                    "# MariaDB Monthly Backup (1st of month, 3 AM)",
+                    f"0 3 1 * * {script_path} --backup monthly --config {config_path} >> /var/log/mariadb_backup.log 2>&1"
+                ]
+            elif schedule_choice == "2":
+                new_entries = [
+                    "# MariaDB Daily Backup (2 AM)",
+                    f"0 2 * * * {script_path} --backup daily --config {config_path} >> /var/log/mariadb_backup.log 2>&1"
+                ]
+            elif schedule_choice == "3":
+                new_entries = [
+                    "# MariaDB Daily Backup (2 AM)",
+                    f"0 2 * * * {script_path} --backup daily --config {config_path} >> /var/log/mariadb_backup.log 2>&1",
+                    "",
+                    "# MariaDB Monthly Backup (1st of month, 3 AM)",
+                    f"0 3 1 * * {script_path} --backup monthly --config {config_path} >> /var/log/mariadb_backup.log 2>&1"
+                ]
+            elif schedule_choice == "4":
+                print("\nCustom schedule:")
+                print("Enter cron schedule (e.g., '0 2 * * *' for daily at 2 AM)")
+                print("Leave empty to skip each type")
+                print()
+                
+                hourly_sched = input("Hourly schedule (e.g., '0 * * * *'): ").strip()
+                if hourly_sched:
+                    new_entries.extend([
+                        "# MariaDB Hourly Backup",
+                        f"{hourly_sched} {script_path} --backup hourly --config {config_path} >> /var/log/mariadb_backup.log 2>&1",
+                        ""
+                    ])
+                
+                daily_sched = input("Daily schedule (e.g., '0 2 * * *'): ").strip()
+                if daily_sched:
+                    new_entries.extend([
+                        "# MariaDB Daily Backup",
+                        f"{daily_sched} {script_path} --backup daily --config {config_path} >> /var/log/mariadb_backup.log 2>&1",
+                        ""
+                    ])
+                
+                monthly_sched = input("Monthly schedule (e.g., '0 3 1 * *'): ").strip()
+                if monthly_sched:
+                    new_entries.extend([
+                        "# MariaDB Monthly Backup",
+                        f"{monthly_sched} {script_path} --backup monthly --config {config_path} >> /var/log/mariadb_backup.log 2>&1"
+                    ])
+            else:
+                print("Invalid option")
+                return
+            
+            if new_entries:
+                print("\n" + "="*60)
+                print("New schedule to be added:")
+                print("-" * 60)
+                for entry in new_entries:
+                    print(entry)
+                print("-" * 60)
+                
+                confirm = input("\nApply this schedule? (yes/no): ").strip().lower()
+                
+                if confirm == "yes":
+                    # Build new crontab: other entries + new MariaDB entries
+                    new_cron_lines = other_entries + [''] + new_entries
+                    new_cron = '\n'.join(new_cron_lines) + '\n'
+                    
+                    try:
+                        proc = subprocess.Popen(['crontab', '-'], stdin=subprocess.PIPE, text=True)
+                        proc.communicate(input=new_cron)
+                        
+                        if proc.returncode == 0:
+                            print("\n✓ Schedule updated successfully!")
+                            print("\nView schedule with: crontab -l")
+                            print("View logs with: tail -f /var/log/mariadb_backup.log")
+                        else:
+                            print("\n✗ Failed to update crontab")
+                    except Exception as e:
+                        print(f"\n✗ Error updating crontab: {e}")
+                else:
+                    print("\nCancelled.")
+        
+        elif choice == "2":
+            if not mariadb_entries:
+                print("\nNo MariaDB backup schedules to remove.")
+                return
+            
+            confirm = input("\nRemove all MariaDB backup schedules? (yes/no): ").strip().lower()
+            
+            if confirm == "yes":
+                # Keep only non-MariaDB entries
+                new_cron = '\n'.join(other_entries) + '\n' if other_entries else ''
+                
+                try:
+                    proc = subprocess.Popen(['crontab', '-'], stdin=subprocess.PIPE, text=True)
+                    proc.communicate(input=new_cron)
+                    
+                    if proc.returncode == 0:
+                        print("\n✓ All MariaDB backup schedules removed")
+                    else:
+                        print("\n✗ Failed to update crontab")
+                except Exception as e:
+                    print(f"\n✗ Error updating crontab: {e}")
+            else:
+                print("\nCancelled.")
+        
+        elif choice == "3":
+            print("\nFull crontab:")
+            print("=" * 60)
+            print(current_cron if current_cron else "(empty)")
+            print("=" * 60)
+            input("\nPress Enter to continue...")
+
     def interactive_menu(self):
         """Main interactive menu"""
         while True:
@@ -1046,6 +1220,7 @@ class MariaDBManager:
             print("\nSETTINGS:")
             print("  8. Configure Settings")
             print("  9. Test MySQL Connection")
+            print(" 10. Manage Backup Schedule (cron)")
             print("\n  0. Exit")
 
             choice = input("\nSelect option: ").strip()
@@ -1110,6 +1285,9 @@ class MariaDBManager:
                     print("✓ Connection successful!")
                 else:
                     print("✗ Connection failed! Check your settings.")
+
+            elif choice == "10":
+                self.manage_schedule()
 
             elif choice == "0":
                 print("\nExiting...")
