@@ -801,13 +801,21 @@ class MariaDBManager:
                 return False
 
             try:
-                # Stop slave if running
+                # Stop slave if running and reset any existing configuration
+                print("  → Stopping any existing slave processes...")
                 cmd = (
                     ["mysql"] + self.get_mysql_connection_args() + ["-e", "STOP SLAVE;"]
                 )
                 subprocess.run(cmd, capture_output=True)
 
+                print("  → Resetting slave configuration...")
+                cmd = (
+                    ["mysql"] + self.get_mysql_connection_args() + ["-e", "RESET SLAVE ALL;"]
+                )
+                subprocess.run(cmd, capture_output=True)
+
                 # Configure slave
+                print("  → Configuring master connection...")
                 change_master_sql = f"""
                 CHANGE MASTER TO
                     MASTER_HOST='{master_host}',
@@ -827,9 +835,14 @@ class MariaDBManager:
 
                 if result.returncode != 0:
                     print(f"ERROR: Failed to configure slave: {result.stderr}")
+                    print("\nTroubleshooting tips:")
+                    print("  1. Check MariaDB error log: journalctl -u mariadb -n 50")
+                    print("  2. Verify master server is accessible")
+                    print("  3. Verify master user has REPLICATION SLAVE privilege")
                     return False
 
                 # Start slave
+                print("  → Starting slave replication...")
                 cmd = (
                     ["mysql"]
                     + self.get_mysql_connection_args()
@@ -842,6 +855,7 @@ class MariaDBManager:
                     return False
 
                 # Check slave status
+                print("  → Checking slave status...")
                 cmd = (
                     ["mysql"]
                     + self.get_mysql_connection_args()
