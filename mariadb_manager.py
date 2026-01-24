@@ -8,14 +8,13 @@ with support for master/slave replication configuration.
 
 import argparse
 import configparser
+import datetime
+import getpass
 import json
 import os
+import shutil
 import subprocess
 import sys
-from datetime import datetime
-from pathlib import Path
-import shutil
-import getpass
 
 
 class MariaDBManager:
@@ -70,7 +69,6 @@ class MariaDBManager:
             print(f"\n⚠️  WARNING: Multiple config files found:")
             for idx, loc in enumerate(existing, 1):
                 size = os.path.getsize(loc)
-                import datetime
                 mtime = datetime.datetime.fromtimestamp(os.path.getmtime(loc))
                 print(f"  {idx}. {loc}")
                 print(f"     Size: {size} bytes, Modified: {mtime}")
@@ -105,6 +103,16 @@ class MariaDBManager:
                 config.set('mysql', 'password', '')
             if not config.has_option('mysql', 'port'):
                 config.set('mysql', 'port', '3306')
+            
+            # Set rotation defaults if missing
+            if not config.has_section('rotation'):
+                config.add_section('rotation')
+            if not config.has_option('rotation', 'hourly_keep'):
+                config.set('rotation', 'hourly_keep', '24')
+            if not config.has_option('rotation', 'daily_keep'):
+                config.set('rotation', 'daily_keep', '31')
+            if not config.has_option('rotation', 'monthly_keep'):
+                config.set('rotation', 'monthly_keep', '12')
                 
         else:
             # Create default configuration
@@ -123,6 +131,11 @@ class MariaDBManager:
             config.set('options', 'compression', 'yes')
             config.set('options', 'encryption', 'no')
             config.set('options', 'encryption_key_file', '/root/.mariadb_backup_key')
+            
+            config.add_section('rotation')
+            config.set('rotation', 'hourly_keep', '24')
+            config.set('rotation', 'daily_keep', '31')
+            config.set('rotation', 'monthly_keep', '12')
 
             self.save_config(config)
             print(f"Default configuration created at {self.config_file}")
@@ -272,7 +285,7 @@ class MariaDBManager:
         os.makedirs(base_dir, exist_ok=True)
 
         # Generate backup name based on type
-        now = datetime.now()
+        now = datetime.datetime.now()
         if backup_type == "hourly":
             # Same hour overwrites: YYYYMMDD_HH
             backup_name = now.strftime("%Y%m%d_%H")
@@ -365,7 +378,7 @@ class MariaDBManager:
 
             with open(users_file, "w") as f:
                 f.write("-- Users and Grants Backup\n")
-                f.write(f"-- Created: {datetime.now()}\n\n")
+                f.write(f"-- Created: {datetime.datetime.now()}\n\n")
 
                 for line in result.stdout.strip().split("\n"):
                     if line.strip():
@@ -506,12 +519,62 @@ class MariaDBManager:
         else:
             print("\n[5/5] Compression disabled")
 
+        # Step 6: Rotation - Clean up old backups
+        print("\n[6/6] Cleaning up old backups...")
+        self.rotate_backups(backup_type, base_dir)
+
         print(f"\n{'='*60}")
         print(f"Backup completed successfully!")
         print(f"Location: {backup_dir}")
         print(f"{'='*60}\n")
 
         return True
+
+    def rotate_backups(self, backup_type, base_dir):
+        """
+        Rotate backups by removing old ones based on retention policy.
+        
+        Args:
+            backup_type: Type of backup ('hourly', 'daily', 'monthly')
+            base_dir: Base directory where backups are stored
+        """
+        # Get retention limit from config
+        keep_count = self.config['rotation'].getint(f'{backup_type}_keep', 0)
+        
+        if keep_count <= 0:
+            print(f"Rotation disabled for {backup_type} backups (keep_count: {keep_count})")
+            return
+        
+        print(f"Keeping last {keep_count} {backup_type} backups...")
+        
+        # Find all backup directories in this location
+        backup_dirs = []
+        if os.path.exists(base_dir):
+            for item in os.listdir(base_dir):
+                item_path = os.path.join(base_dir, item)
+                if os.path.isdir(item_path) and item.startswith("backup_"):
+                    # Get modification time
+                    mtime = os.path.getmtime(item_path)
+                    backup_dirs.append((item_path, mtime, item))
+        
+        # Sort by modification time (newest first)
+        backup_dirs.sort(key=lambda x: x[1], reverse=True)
+        
+        # Keep the newest keep_count backups, delete the rest
+        deleted_count = 0
+        for i, (backup_path, mtime, name) in enumerate(backup_dirs):
+            if i >= keep_count:
+                try:
+                    shutil.rmtree(backup_path)
+                    deleted_count += 1
+                    print(f"  Deleted old backup: {name}")
+                except Exception as e:
+                    print(f"  WARNING: Failed to delete {name}: {e}")
+        
+        if deleted_count > 0:
+            print(f"Deleted {deleted_count} old backup(s)")
+        else:
+            print(f"No old backups to delete (total: {len(backup_dirs)}, keeping: {keep_count})")
 
     def list_backups(self, backup_type=None):
         """List available backups"""
@@ -814,9 +877,10 @@ class MariaDBManager:
             print("\n1. MySQL Connection Settings")
             print("2. Backup Paths")
             print("3. Backup Options")
-            print("4. Test MySQL Connection")
-            print("5. View Current Configuration")
-            print("6. Save and Exit")
+            print("4. Backup Rotation Settings")
+            print("5. Test MySQL Connection")
+            print("6. View Current Configuration")
+            print("7. Save and Exit")
             print("0. Exit without saving")
 
             choice = input("\nSelect option: ").strip()
@@ -869,6 +933,27 @@ class MariaDBManager:
                     self.config.set('options', 'compression', compression)
 
             elif choice == "4":
+                print("\n--- Backup Rotation Settings ---")
+                print("Set how many backups to keep for each type (0 = unlimited)")
+                
+                hourly = input(f"Hourly backups to keep [{self.config['rotation'].get('hourly_keep', '24')}]: ").strip()
+                if hourly:
+                    self.config.set('rotation', 'hourly_keep', hourly)
+                    print(f"  → Will keep last {hourly} hourly backups")
+                
+                daily = input(f"Daily backups to keep [{self.config['rotation'].get('daily_keep', '31')}]: ").strip()
+                if daily:
+                    self.config.set('rotation', 'daily_keep', daily)
+                    print(f"  → Will keep last {daily} daily backups")
+                
+                monthly = input(f"Monthly backups to keep [{self.config['rotation'].get('monthly_keep', '12')}]: ").strip()
+                if monthly:
+                    self.config.set('rotation', 'monthly_keep', monthly)
+                    print(f"  → Will keep last {monthly} monthly backups")
+                
+                print(f"\n✓ Rotation settings updated in memory (not saved yet)")
+
+            elif choice == "5":
                 print("\nTesting MySQL connection...")
                 print(f"  Host: {self.config['mysql']['host']}")
                 print(f"  Port: {self.config['mysql']['port']}")
@@ -882,13 +967,12 @@ class MariaDBManager:
                     print("\nTip: Test manually with:")
                     print(f"  mysql --host={self.config['mysql']['host']} --port={self.config['mysql']['port']} --user={self.config['mysql']['user']} -p")
 
-            elif choice == "5":
+            elif choice == "6":
                 print("\n--- Current Configuration ---")
                 print(f"Config file: {os.path.abspath(self.config_file)}")
                 print(f"File exists: {os.path.exists(self.config_file)}")
                 if os.path.exists(self.config_file):
                     print(f"File size: {os.path.getsize(self.config_file)} bytes")
-                    import datetime
                     mtime = os.path.getmtime(self.config_file)
                     print(f"Last modified: {datetime.datetime.fromtimestamp(mtime)}")
                 
@@ -904,11 +988,15 @@ class MariaDBManager:
                 print(f"  monthly = {self.config['backup_paths']['monthly']}")
                 print(f"\n[options]")
                 print(f"  compression = {self.config['options'].get('compression', 'yes')}")
+                print(f"\n[rotation]")
+                print(f"  hourly_keep = {self.config['rotation'].get('hourly_keep', '24')}")
+                print(f"  daily_keep = {self.config['rotation'].get('daily_keep', '31')}")
+                print(f"  monthly_keep = {self.config['rotation'].get('monthly_keep', '12')}")
                 
                 print(f"\nPress Enter to continue...")
                 input()
 
-            elif choice == "6":
+            elif choice == "7":
                 if self.save_config():
                     print(f"\n✓ Configuration saved to {self.config_file}!")
                     print(f"  File size: {os.path.getsize(self.config_file)} bytes")

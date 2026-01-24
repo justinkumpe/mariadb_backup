@@ -6,6 +6,7 @@ A comprehensive Python-based solution for managing MariaDB backups with support 
 
 - ✅ **Complete Database Backups**: All databases, users, grants, and replication information
 - ✅ **Multiple Backup Types**: Hourly, daily, and monthly with automatic overwrites
+- ✅ **Backup Rotation**: Configurable retention - keep last N backups of each type
 - ✅ **Automatic Slave Configuration**: Restore backups with automatic replication setup
 - ✅ **Dual Operation Modes**: Interactive menu or command-line for cron jobs
 - ✅ **Flexible Configuration**: Config file, command-line args, or interactive menu
@@ -40,6 +41,11 @@ A comprehensive Python-based solution for managing MariaDB backups with support 
    
    [options]
    compression = yes
+   
+   [rotation]
+   hourly_keep = 24
+   daily_keep = 31
+   monthly_keep = 12
    ```
 
 4. **Secure the configuration file**:
@@ -238,6 +244,65 @@ backup_YYYYMMDD_HH/
 - **Daily**: Backups with same YYYYMMDD overwrite (31 backups max per location)
 - **Monthly**: Backups with same YYYYMM overwrite (12 backups max per location)
 - **Manual**: Uses full timestamp, never overwrites
+
+## Backup Rotation
+
+Backup rotation automatically deletes old backups based on the retention policy configured in `[rotation]` section:
+
+```ini
+[rotation]
+hourly_keep = 24    # Keep last 24 hourly backups (0 = unlimited)
+daily_keep = 31     # Keep last 31 daily backups
+monthly_keep = 12   # Keep last 12 monthly backups
+```
+
+### How Rotation Works
+
+1. After each successful backup, the rotation cleanup runs automatically
+2. Backups are sorted by modification time (newest first)
+3. The configured number of backups are kept, older ones are deleted
+4. Example with `hourly_keep = 24`:
+   - After creating backup #25, backup #1 (oldest) is deleted
+   - Always maintains exactly 24 hourly backups
+
+### Rotation Configuration
+
+**Via Config File:**
+```ini
+[rotation]
+hourly_keep = 24
+daily_keep = 31
+monthly_keep = 12
+```
+
+**Via Interactive Menu:**
+1. Run `./mariadb_manager.py`
+2. Select option `8` (Configure Settings)
+3. Select option `4` (Backup Rotation Settings)
+4. Enter desired retention counts
+5. Save configuration
+
+**Disable Rotation:**
+Set any `_keep` value to `0` to keep unlimited backups of that type:
+```ini
+[rotation]
+monthly_keep = 0  # Never delete monthly backups
+```
+
+### Disk Space Management
+
+Monitor disk usage and adjust rotation settings accordingly:
+
+```bash
+# Check backup directory sizes
+du -sh /var/backups/mariadb/*
+
+# Set aggressive rotation for testing
+[rotation]
+hourly_keep = 2
+daily_keep = 7
+monthly_keep = 3
+```
 
 ## Setting Up Replication
 
