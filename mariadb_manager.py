@@ -15,6 +15,8 @@ import os
 import shutil
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 
 
 class MariaDBManager:
@@ -113,6 +115,14 @@ class MariaDBManager:
                 config.set('rotation', 'daily_keep', '31')
             if not config.has_option('rotation', 'monthly_keep'):
                 config.set('rotation', 'monthly_keep', '12')
+
+            # Webhook defaults
+            if not config.has_section('webhooks'):
+                config.add_section('webhooks')
+            if not config.has_option('webhooks', 'success_url'):
+                config.set('webhooks', 'success_url', '')
+            if not config.has_option('webhooks', 'failure_url'):
+                config.set('webhooks', 'failure_url', '')
                 
         else:
             # Create default configuration
@@ -136,6 +146,10 @@ class MariaDBManager:
             config.set('rotation', 'hourly_keep', '24')
             config.set('rotation', 'daily_keep', '31')
             config.set('rotation', 'monthly_keep', '12')
+
+            config.add_section('webhooks')
+            config.set('webhooks', 'success_url', '')
+            config.set('webhooks', 'failure_url', '')
 
             self.save_config(config)
             print(f"Default configuration created at {self.config_file}")
@@ -236,6 +250,49 @@ class MariaDBManager:
             print(f"Connection test failed: {e}")
             return False
 
+    def notify_backup_webhook(self, success, backup_type, backup_dir, message=None):
+        """Send webhook notification if configured."""
+        url_key = 'success_url' if success else 'failure_url'
+        webhooks_cfg = self.config['webhooks'] if self.config.has_section('webhooks') else {}
+        url = webhooks_cfg.get(url_key, '').strip() if hasattr(webhooks_cfg, 'get') else ''
+        if not url:
+            return
+
+        payload = {
+            "status": "success" if success else "failure",
+            "backup_type": backup_type,
+            "backup_dir": backup_dir,
+            "backup_name": os.path.basename(backup_dir) if backup_dir else None,
+            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        }
+        if message:
+            payload["message"] = message
+
+        # Include simple size info when available
+        if backup_dir and os.path.exists(backup_dir):
+            try:
+                size_bytes = sum(
+                    os.path.getsize(os.path.join(backup_dir, f))
+                    for f in os.listdir(backup_dir)
+                    if os.path.isfile(os.path.join(backup_dir, f))
+                )
+                payload["size_bytes"] = size_bytes
+            except OSError:
+                pass
+
+        try:
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                url, data=data, headers={"Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                resp.read()
+            print(f"Webhook sent to {url_key}: {url}")
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
+            print(f"WARNING: Failed to send webhook to {url}: {e}")
+        except Exception as e:  # Fallback for unexpected issues
+            print(f"WARNING: Unexpected error while sending webhook: {e}")
+
     def get_master_status(self):
         """Get master replication status"""
         try:
@@ -310,10 +367,14 @@ class MariaDBManager:
 
         print(f"Backup directory: {backup_dir}")
 
+        def notify_failure(reason):
+            self.notify_backup_webhook(False, backup_type, backup_dir, reason)
+            return False
+
         # Test connection
         if not self.test_connection():
             print("ERROR: Cannot connect to MySQL. Check your credentials.")
-            return False
+            return notify_failure("MySQL connection failed")
 
         print("✓ MySQL connection successful")
 
@@ -349,14 +410,14 @@ class MariaDBManager:
 
             if result.returncode != 0:
                 print(f"ERROR: Database backup failed: {result.stderr}")
-                return False
+                return notify_failure("Database backup failed")
 
             print(
                 f"✓ Database backup completed: {os.path.getsize(db_backup_file)} bytes"
             )
         except Exception as e:
             print(f"ERROR: Database backup failed: {e}")
-            return False
+            return notify_failure("Database backup crashed")
 
         # 2. Backup users and grants
         print("\n[2/5] Backing up users and grants...")
@@ -527,7 +588,7 @@ class MariaDBManager:
         print(f"Backup completed successfully!")
         print(f"Location: {backup_dir}")
         print(f"{'='*60}\n")
-
+        self.notify_backup_webhook(True, backup_type, backup_dir, "Backup completed")
         return True
 
     def rotate_backups(self, backup_type, base_dir):
@@ -878,7 +939,6 @@ class MariaDBManager:
         print(f"\n{'='*60}")
         print("Restore completed successfully!")
         print(f"{'='*60}\n")
-
         return True
 
     def configure_settings(self):
@@ -894,9 +954,10 @@ class MariaDBManager:
             print("2. Backup Paths")
             print("3. Backup Options")
             print("4. Backup Rotation Settings")
-            print("5. Test MySQL Connection")
-            print("6. View Current Configuration")
-            print("7. Save and Exit")
+            print("5. Webhook Settings")
+            print("6. Test MySQL Connection")
+            print("7. View Current Configuration")
+            print("8. Save and Exit")
             print("0. Exit without saving")
 
             choice = input("\nSelect option: ").strip()
@@ -970,6 +1031,24 @@ class MariaDBManager:
                 print(f"\n✓ Rotation settings updated in memory (not saved yet)")
 
             elif choice == "5":
+                print("\n--- Webhook Settings ---")
+                current_success = self.config['webhooks'].get('success_url', '') if self.config.has_section('webhooks') else ''
+                current_failure = self.config['webhooks'].get('failure_url', '') if self.config.has_section('webhooks') else ''
+                success = input(f"Success webhook URL [{current_success}]: ").strip()
+                if success:
+                    if not self.config.has_section('webhooks'):
+                        self.config.add_section('webhooks')
+                    self.config.set('webhooks', 'success_url', success)
+                    print(f"  → Success webhook set")
+                failure = input(f"Failure webhook URL [{current_failure}]: ").strip()
+                if failure:
+                    if not self.config.has_section('webhooks'):
+                        self.config.add_section('webhooks')
+                    self.config.set('webhooks', 'failure_url', failure)
+                    print(f"  → Failure webhook set")
+                print("\n✓ Webhook settings updated in memory (not saved yet)")
+
+            elif choice == "6":
                 print("\nTesting MySQL connection...")
                 print(f"  Host: {self.config['mysql']['host']}")
                 print(f"  Port: {self.config['mysql']['port']}")
@@ -983,7 +1062,7 @@ class MariaDBManager:
                     print("\nTip: Test manually with:")
                     print(f"  mysql --host={self.config['mysql']['host']} --port={self.config['mysql']['port']} --user={self.config['mysql']['user']} -p")
 
-            elif choice == "6":
+            elif choice == "7":
                 print("\n--- Current Configuration ---")
                 print(f"Config file: {os.path.abspath(self.config_file)}")
                 print(f"File exists: {os.path.exists(self.config_file)}")
@@ -1008,11 +1087,15 @@ class MariaDBManager:
                 print(f"  hourly_keep = {self.config['rotation'].get('hourly_keep', '24')}")
                 print(f"  daily_keep = {self.config['rotation'].get('daily_keep', '31')}")
                 print(f"  monthly_keep = {self.config['rotation'].get('monthly_keep', '12')}")
+                if self.config.has_section('webhooks'):
+                    print(f"\n[webhooks]")
+                    print(f"  success_url = {self.config['webhooks'].get('success_url', '')}")
+                    print(f"  failure_url = {self.config['webhooks'].get('failure_url', '')}")
                 
                 print(f"\nPress Enter to continue...")
                 input()
 
-            elif choice == "7":
+            elif choice == "8":
                 if self.save_config():
                     print(f"\n✓ Configuration saved to {self.config_file}!")
                     print(f"  File size: {os.path.getsize(self.config_file)} bytes")

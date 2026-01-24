@@ -176,6 +176,29 @@ if [[ "$configure_dirs" =~ ^[Yy]$ ]]; then
     fi
 fi
 
+# Setup webhooks
+echo ""
+echo "Configure webhook URLs for notifications? (y/n)"
+read -p "> " configure_webhooks
+
+if [[ "$configure_webhooks" =~ ^[Yy]$ ]]; then
+    read -p "Success webhook URL (leave empty to skip): " success_url
+    read -p "Failure webhook URL (leave empty to skip): " failure_url
+
+    if command -v sed &> /dev/null; then
+        if [[ -n "$success_url" ]]; then
+            sed -i.bak "s|^success_url =.*|success_url = $success_url|" "$CONFIG_FILE"
+        fi
+        if [[ -n "$failure_url" ]]; then
+            sed -i.bak "s|^failure_url =.*|failure_url = $failure_url|" "$CONFIG_FILE"
+        fi
+        rm -f "${CONFIG_FILE}.bak"
+        echo "✓ Webhook URLs configured"
+    else
+        echo "⚠ sed not found, please edit $CONFIG_FILE manually (section [webhooks])"
+    fi
+fi
+
 # Test connection
 echo ""
 echo "Test MySQL connection? (y/n)"

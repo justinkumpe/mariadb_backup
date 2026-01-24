@@ -18,3 +18,7 @@ encryption_key_file = /root/.mariadb_backup_key
 hourly_keep = 24
 daily_keep = 31
 monthly_keep = 12
+
+[webhooks]
+success_url = 
+failure_url = 

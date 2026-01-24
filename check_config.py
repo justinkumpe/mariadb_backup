@@ -40,7 +40,8 @@ if os.path.exists(config_file):
     required = {
         'mysql': ['host', 'user', 'password', 'port'],
         'backup_paths': ['hourly', 'daily', 'monthly'],
-        'options': ['compression']
+        'options': ['compression'],
+        'webhooks': ['success_url', 'failure_url'],
     }
     
     all_good = True
@@ -67,7 +68,6 @@ if os.path.exists(config_file):
         print("\n✗ Some fields missing")
     
     # Test 5: Check file permissions
-    import stat
     mode = oct(os.stat(config_file).st_mode)[-3:]
     print(f"\nFile permissions: {mode}")
     if mode == '600':
