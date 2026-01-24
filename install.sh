@@ -206,16 +206,64 @@ if [ "$INSTALL_DIR" != "." ]; then
 fi
 echo "Config location: $CONFIG_FILE"
 echo ""
+echo "⚠️  IMPORTANT: Always specify the config file location!"
+echo ""
 echo "Usage:"
 if [ "$INSTALL_DIR" != "." ]; then
-    echo "  $INSTALL_DIR/mariadb_manager.py                    # Interactive menu"
-    echo "  $INSTALL_DIR/mariadb_manager.py --backup daily     # Create backup"
-    echo "  $INSTALL_DIR/mariadb_manager.py --list             # List backups"
+    echo "  $INSTALL_DIR/mariadb_manager.py --config $CONFIG_FILE"
+    echo "  $INSTALL_DIR/mariadb_manager.py --config $CONFIG_FILE --backup daily"
+    echo "  $INSTALL_DIR/mariadb_manager.py --config $CONFIG_FILE --list"
 else
-    echo "  ./mariadb_manager.py                    # Interactive menu"
-    echo "  ./mariadb_manager.py --backup daily     # Create backup"
-    echo "  ./mariadb_manager.py --list             # List backups"
+    echo "  ./mariadb_manager.py --config $CONFIG_FILE"
+    echo "  ./mariadb_manager.py --config $CONFIG_FILE --backup daily"
+    echo "  ./mariadb_manager.py --config $CONFIG_FILE --list"
 fi
+echo ""
+
+# Offer to create convenience alias
+echo "Would you like to create a convenience command? (y/n)"
+read -p "> " create_alias
+
+if [[ "$create_alias" =~ ^[Yy]$ ]]; then
+    if [ "$INSTALL_DIR" != "." ]; then
+        SCRIPT_PATH="$INSTALL_DIR/mariadb_manager.py"
+    else
+        SCRIPT_PATH="$(pwd)/mariadb_manager.py"
+    fi
+    
+    # Create wrapper script
+    WRAPPER="/usr/local/bin/mariadb-backup"
+    
+    if [ -w "/usr/local/bin" ] || [[ $EUID -eq 0 ]]; then
+        cat > "$WRAPPER" <<EOF
+#!/bin/bash
+# MariaDB Backup Manager wrapper
+exec $SCRIPT_PATH --config $CONFIG_FILE "\$@"
+EOF
+        chmod +x "$WRAPPER"
+        echo "✓ Created wrapper script: $WRAPPER"
+        echo ""
+        echo "You can now simply run:"
+        echo "  mariadb-backup              # Interactive menu"
+        echo "  mariadb-backup --backup daily"
+        echo "  mariadb-backup --list"
+    else
+        # Fall back to alias
+        echo ""
+        echo "Add this alias to your ~/.bashrc or ~/.bash_aliases:"
+        echo "  alias mariadb-backup='$SCRIPT_PATH --config $CONFIG_FILE'"
+        echo ""
+        read -p "Add to ~/.bashrc now? (y/n): " add_alias
+        if [[ "$add_alias" =~ ^[Yy]$ ]]; then
+            echo "" >> ~/.bashrc
+            echo "# MariaDB Backup Manager" >> ~/.bashrc
+            echo "alias mariadb-backup='$SCRIPT_PATH --config $CONFIG_FILE'" >> ~/.bashrc
+            echo "✓ Alias added to ~/.bashrc"
+            echo "Run: source ~/.bashrc  (or restart your shell)"
+        fi
+    fi
+fi
+
 echo ""
 echo "For full documentation, see README.md"
 echo ""

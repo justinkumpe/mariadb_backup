@@ -19,9 +19,67 @@ import getpass
 
 
 class MariaDBManager:
-    def __init__(self, config_file="mariadb_backup.conf"):
+    def __init__(self, config_file=None):
+        # If no config specified, search for existing configs
+        if config_file is None:
+            config_file = self.find_config_file()
+        
         self.config_file = config_file
         self.config = self.load_config()
+    
+    def find_config_file(self):
+        """Find existing config file or determine where to create one"""
+        # Priority order for searching/creating config files
+        search_locations = [
+            '/etc/mariadb_backup.conf',
+            os.path.expanduser('~/.config/mariadb_backup.conf'),
+            'mariadb_backup.conf',  # Current directory (last resort)
+        ]
+        
+        # Check if any exist
+        existing = []
+        for loc in search_locations:
+            if os.path.exists(loc):
+                existing.append(loc)
+        
+        if len(existing) == 0:
+            # No config exists, use first writable location
+            for loc in search_locations:
+                try:
+                    # Try to create parent directory
+                    parent = os.path.dirname(loc)
+                    if parent and not os.path.exists(parent):
+                        os.makedirs(parent, exist_ok=True)
+                    # Test if we can write there
+                    test_file = loc + '.test'
+                    with open(test_file, 'w') as f:
+                        f.write('test')
+                    os.remove(test_file)
+                    return loc
+                except (PermissionError, OSError):
+                    continue
+            # Fallback to current directory
+            return 'mariadb_backup.conf'
+        
+        elif len(existing) == 1:
+            # One config found, use it
+            return existing[0]
+        
+        else:
+            # Multiple configs found - warn and use first one
+            print(f"\n⚠️  WARNING: Multiple config files found:")
+            for idx, loc in enumerate(existing, 1):
+                size = os.path.getsize(loc)
+                import datetime
+                mtime = datetime.datetime.fromtimestamp(os.path.getmtime(loc))
+                print(f"  {idx}. {loc}")
+                print(f"     Size: {size} bytes, Modified: {mtime}")
+            
+            print(f"\nUsing: {existing[0]}")
+            print(f"To use a different config, run with: --config <path>")
+            print(f"Or delete unused config files.\n")
+            
+            return existing[0]
 
     def load_config(self):
         """Load configuration from file or create default"""
@@ -991,7 +1049,8 @@ Examples:
     )
 
     parser.add_argument(
-        "--config", "-c", default="mariadb_backup.conf", help="Configuration file path"
+        "--config", "-c", default=None, 
+        help="Configuration file path (default: auto-detect from /etc, ~/.config, or current directory)"
     )
     parser.add_argument(
         "--backup",
