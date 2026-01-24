@@ -214,12 +214,18 @@ systemctl list-timers | grep mariadb
 Each backup contains:
 
 ```
-backup_YYYYMMDD_HH/
+backup_daily_20260122/              # Type and date clearly indicated
 ├── all_databases.sql.gz          # All databases with structure and data
 ├── users_and_grants.sql.gz       # User accounts and grants
 ├── replication_info.json         # Binary log position and server info
 └── MANIFEST.txt                  # Backup metadata and file list
 ```
+
+**Backup naming patterns:**
+- Hourly: `backup_hourly_YYYYMMDD_HH` (e.g., `backup_hourly_20260122_14`)
+- Daily: `backup_daily_YYYYMMDD` (e.g., `backup_daily_20260122`)
+- Monthly: `backup_monthly_YYYYMM` (e.g., `backup_monthly_202601`)
+- Manual: `backup_manual_YYYYMMDD_HHMMSS` (e.g., `backup_manual_20260122_143052`)
 
 ### Replication Info Format
 
@@ -240,10 +246,10 @@ backup_YYYYMMDD_HH/
 
 ## Backup Overwrite Behavior
 
-- **Hourly**: Backups with same YYYYMMDD_HH overwrite (24 backups max per location)
-- **Daily**: Backups with same YYYYMMDD overwrite (31 backups max per location)
-- **Monthly**: Backups with same YYYYMM overwrite (12 backups max per location)
-- **Manual**: Uses full timestamp, never overwrites
+- **Hourly**: Backups with same type and hour overwrite (e.g., `backup_hourly_20260122_14`)
+- **Daily**: Backups with same type and day overwrite (e.g., `backup_daily_20260122`)
+- **Monthly**: Backups with same type and month overwrite (e.g., `backup_monthly_202601`)
+- **Manual**: Uses full timestamp with type, never overwrites (e.g., `backup_manual_20260122_143052`)
 
 ## Backup Rotation
 

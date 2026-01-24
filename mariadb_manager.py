@@ -287,17 +287,17 @@ class MariaDBManager:
         # Generate backup name based on type
         now = datetime.datetime.now()
         if backup_type == "hourly":
-            # Same hour overwrites: YYYYMMDD_HH
-            backup_name = now.strftime("%Y%m%d_%H")
+            # Same hour overwrites: hourly_YYYYMMDD_HH
+            backup_name = f"hourly_{now.strftime('%Y%m%d_%H')}"
         elif backup_type == "daily":
-            # Same day overwrites: YYYYMMDD
-            backup_name = now.strftime("%Y%m%d")
+            # Same day overwrites: daily_YYYYMMDD
+            backup_name = f"daily_{now.strftime('%Y%m%d')}"
         elif backup_type == "monthly":
-            # Same month overwrites: YYYYMM
-            backup_name = now.strftime("%Y%m")
+            # Same month overwrites: monthly_YYYYMM
+            backup_name = f"monthly_{now.strftime('%Y%m')}"
         else:
             # Manual/other: full timestamp
-            backup_name = now.strftime("%Y%m%d_%H%M%S")
+            backup_name = f"manual_{now.strftime('%Y%m%d_%H%M%S')}"
 
         backup_dir = os.path.join(base_dir, f"backup_{backup_name}")
 
@@ -552,7 +552,8 @@ class MariaDBManager:
         if os.path.exists(base_dir):
             for item in os.listdir(base_dir):
                 item_path = os.path.join(base_dir, item)
-                if os.path.isdir(item_path) and item.startswith("backup_"):
+                # Match backup directories for this specific type
+                if os.path.isdir(item_path) and item.startswith(f"backup_{backup_type}_"):
                     # Get modification time
                     mtime = os.path.getmtime(item_path)
                     backup_dirs.append((item_path, mtime, item))
@@ -593,7 +594,8 @@ class MariaDBManager:
             if path and os.path.exists(path):
                 for item in os.listdir(path):
                     item_path = os.path.join(path, item)
-                    if os.path.isdir(item_path) and item.startswith("backup_"):
+                    # Match both old and new naming patterns for backwards compatibility
+                    if os.path.isdir(item_path) and (item.startswith(f"backup_{btype}_") or (item.startswith("backup_") and not any(item.startswith(f"backup_{t}_") for t in ["hourly", "daily", "monthly", "manual"]))):
                         manifest_file = os.path.join(item_path, "MANIFEST.txt")
                         if os.path.exists(manifest_file):
                             mtime = os.path.getmtime(item_path)
