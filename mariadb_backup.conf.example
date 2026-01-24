@@ -1,0 +1,15 @@
+[mysql]
+host = localhost
+user = root
+password = your_mysql_password_here
+port = 3306
+
+[backup_paths]
+hourly = /var/backups/mariadb/hourly
+daily = /var/backups/mariadb/daily
+monthly = /var/backups/mariadb/monthly
+
+[options]
+compression = yes
+encryption = no
+encryption_key_file = /root/.mariadb_backup_key
