@@ -714,6 +714,8 @@ class MariaDBManager:
         """Interactive configuration menu"""
         print(f"\n{'='*60}")
         print("Configuration Settings")
+        print(f"{'='*60}")
+        print(f"Config file: {os.path.abspath(self.config_file)}")
         print(f"{'='*60}\n")
 
         while True:
@@ -823,6 +825,8 @@ class MariaDBManager:
         while True:
             print(f"\n{'='*60}")
             print("MariaDB Backup & Restore Manager")
+            print(f"{'='*60}")
+            print(f"Config: {os.path.abspath(self.config_file)}")
             print(f"{'='*60}")
             print("\nBACKUP OPTIONS:")
             print("  1. Create Hourly Backup")
