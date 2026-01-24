@@ -29,24 +29,42 @@ class MariaDBManager:
 
         if os.path.exists(self.config_file):
             config.read(self.config_file)
+            
+            # Ensure all required sections exist
+            if not config.has_section('mysql'):
+                config.add_section('mysql')
+            if not config.has_section('backup_paths'):
+                config.add_section('backup_paths')
+            if not config.has_section('options'):
+                config.add_section('options')
+            
+            # Set defaults for missing values
+            if not config.has_option('mysql', 'host'):
+                config['mysql']['host'] = 'localhost'
+            if not config.has_option('mysql', 'user'):
+                config['mysql']['user'] = 'root'
+            if not config.has_option('mysql', 'password'):
+                config['mysql']['password'] = ''
+            if not config.has_option('mysql', 'port'):
+                config['mysql']['port'] = '3306'
+                
         else:
             # Create default configuration
-            config["mysql"] = {
-                "host": "localhost",
-                "user": "root",
-                "password": "",
-                "port": "3306",
-            }
-            config["backup_paths"] = {
-                "hourly": "/var/backups/mariadb/hourly",
-                "daily": "/var/backups/mariadb/daily",
-                "monthly": "/var/backups/mariadb/monthly",
-            }
-            config["options"] = {
-                "compression": "yes",
-                "encryption": "no",
-                "encryption_key_file": "/root/.mariadb_backup_key",
-            }
+            config.add_section('mysql')
+            config['mysql']['host'] = 'localhost'
+            config['mysql']['user'] = 'root'
+            config['mysql']['password'] = ''
+            config['mysql']['port'] = '3306'
+            
+            config.add_section('backup_paths')
+            config['backup_paths']['hourly'] = '/var/backups/mariadb/hourly'
+            config['backup_paths']['daily'] = '/var/backups/mariadb/daily'
+            config['backup_paths']['monthly'] = '/var/backups/mariadb/monthly'
+            
+            config.add_section('options')
+            config['options']['compression'] = 'yes'
+            config['options']['encryption'] = 'no'
+            config['options']['encryption_key_file'] = '/root/.mariadb_backup_key'
 
             self.save_config(config)
             print(f"Default configuration created at {self.config_file}")
@@ -75,8 +93,16 @@ class MariaDBManager:
     def test_connection(self):
         """Test MySQL connection"""
         try:
+            # Check if required config values are present
+            if not self.config.get('mysql', 'password', fallback=''):
+                print("WARNING: MySQL password is empty")
+            
             cmd = ["mysql"] + self.get_mysql_connection_args() + ["-e", "SELECT 1;"]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            
+            if result.returncode != 0:
+                print(f"Connection error: {result.stderr}")
+                
             return result.returncode == 0
         except Exception as e:
             print(f"Connection test failed: {e}")
@@ -722,14 +748,23 @@ class MariaDBManager:
 
             elif choice == "4":
                 print("\nTesting MySQL connection...")
+                print(f"  Host: {self.config['mysql']['host']}")
+                print(f"  Port: {self.config['mysql']['port']}")
+                print(f"  User: {self.config['mysql']['user']}")
+                print(f"  Password: {'*' * len(self.config['mysql'].get('password', '')) if self.config['mysql'].get('password') else '(empty)'}")
+                print()
                 if self.test_connection():
                     print("✓ Connection successful!")
                 else:
                     print("✗ Connection failed! Check your settings.")
+                    print("\nTip: Test manually with:")
+                    print(f"  mysql --host={self.config['mysql']['host']} --port={self.config['mysql']['port']} --user={self.config['mysql']['user']} -p")
 
             elif choice == "5":
                 self.save_config()
                 print("\n✓ Configuration saved!")
+                # Reload config to ensure consistency
+                self.config = self.load_config()
                 break
 
             elif choice == "0":
