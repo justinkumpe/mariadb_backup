@@ -40,31 +40,31 @@ class MariaDBManager:
             
             # Set defaults for missing values
             if not config.has_option('mysql', 'host'):
-                config['mysql']['host'] = 'localhost'
+                config.set('mysql', 'host', 'localhost')
             if not config.has_option('mysql', 'user'):
-                config['mysql']['user'] = 'root'
+                config.set('mysql', 'user', 'root')
             if not config.has_option('mysql', 'password'):
-                config['mysql']['password'] = ''
+                config.set('mysql', 'password', '')
             if not config.has_option('mysql', 'port'):
-                config['mysql']['port'] = '3306'
+                config.set('mysql', 'port', '3306')
                 
         else:
             # Create default configuration
             config.add_section('mysql')
-            config['mysql']['host'] = 'localhost'
-            config['mysql']['user'] = 'root'
-            config['mysql']['password'] = ''
-            config['mysql']['port'] = '3306'
+            config.set('mysql', 'host', 'localhost')
+            config.set('mysql', 'user', 'root')
+            config.set('mysql', 'password', '')
+            config.set('mysql', 'port', '3306')
             
             config.add_section('backup_paths')
-            config['backup_paths']['hourly'] = '/var/backups/mariadb/hourly'
-            config['backup_paths']['daily'] = '/var/backups/mariadb/daily'
-            config['backup_paths']['monthly'] = '/var/backups/mariadb/monthly'
+            config.set('backup_paths', 'hourly', '/var/backups/mariadb/hourly')
+            config.set('backup_paths', 'daily', '/var/backups/mariadb/daily')
+            config.set('backup_paths', 'monthly', '/var/backups/mariadb/monthly')
             
             config.add_section('options')
-            config['options']['compression'] = 'yes'
-            config['options']['encryption'] = 'no'
-            config['options']['encryption_key_file'] = '/root/.mariadb_backup_key'
+            config.set('options', 'compression', 'yes')
+            config.set('options', 'encryption', 'no')
+            config.set('options', 'encryption_key_file', '/root/.mariadb_backup_key')
 
             self.save_config(config)
             print(f"Default configuration created at {self.config_file}")
@@ -80,6 +80,12 @@ class MariaDBManager:
         with open(self.config_file, "w") as f:
             config.write(f)
         os.chmod(self.config_file, 0o600)
+        
+        # Debug: Verify file was written
+        if os.path.exists(self.config_file):
+            size = os.path.getsize(self.config_file)
+            return True
+        return False
 
     def get_mysql_connection_args(self):
         """Get MySQL connection arguments"""
@@ -698,45 +704,43 @@ class MariaDBManager:
             print("2. Backup Paths")
             print("3. Backup Options")
             print("4. Test MySQL Connection")
-            print("5. Save and Exit")
+            print("5. View Current Configuration")
+            print("6. Save and Exit")
             print("0. Exit without saving")
 
             choice = input("\nSelect option: ").strip()
 
             if choice == "1":
                 print("\n--- MySQL Connection Settings ---")
-                self.config["mysql"]["host"] = (
-                    input(f"Host [{self.config['mysql']['host']}]: ").strip()
-                    or self.config["mysql"]["host"]
-                )
-                self.config["mysql"]["port"] = (
-                    input(f"Port [{self.config['mysql']['port']}]: ").strip()
-                    or self.config["mysql"]["port"]
-                )
-                self.config["mysql"]["user"] = (
-                    input(f"User [{self.config['mysql']['user']}]: ").strip()
-                    or self.config["mysql"]["user"]
-                )
+                host = input(f"Host [{self.config['mysql']['host']}]: ").strip()
+                if host:
+                    self.config.set('mysql', 'host', host)
+                
+                port = input(f"Port [{self.config['mysql']['port']}]: ").strip()
+                if port:
+                    self.config.set('mysql', 'port', port)
+                
+                user = input(f"User [{self.config['mysql']['user']}]: ").strip()
+                if user:
+                    self.config.set('mysql', 'user', user)
+                
                 password = getpass.getpass("Password (leave empty to keep current): ")
                 if password:
-                    self.config["mysql"]["password"] = password
+                    self.config.set('mysql', 'password', password)
 
             elif choice == "2":
                 print("\n--- Backup Paths ---")
-                self.config["backup_paths"]["hourly"] = (
-                    input(f"Hourly [{self.config['backup_paths']['hourly']}]: ").strip()
-                    or self.config["backup_paths"]["hourly"]
-                )
-                self.config["backup_paths"]["daily"] = (
-                    input(f"Daily [{self.config['backup_paths']['daily']}]: ").strip()
-                    or self.config["backup_paths"]["daily"]
-                )
-                self.config["backup_paths"]["monthly"] = (
-                    input(
-                        f"Monthly [{self.config['backup_paths']['monthly']}]: "
-                    ).strip()
-                    or self.config["backup_paths"]["monthly"]
-                )
+                hourly = input(f"Hourly [{self.config['backup_paths']['hourly']}]: ").strip()
+                if hourly:
+                    self.config.set('backup_paths', 'hourly', hourly)
+                
+                daily = input(f"Daily [{self.config['backup_paths']['daily']}]: ").strip()
+                if daily:
+                    self.config.set('backup_paths', 'daily', daily)
+                
+                monthly = input(f"Monthly [{self.config['backup_paths']['monthly']}]: ").strip()
+                if monthly:
+                    self.config.set('backup_paths', 'monthly', monthly)
 
             elif choice == "3":
                 print("\n--- Backup Options ---")
@@ -744,7 +748,7 @@ class MariaDBManager:
                     f"Enable compression (yes/no) [{self.config['options'].get('compression', 'yes')}]: "
                 ).strip()
                 if compression:
-                    self.config["options"]["compression"] = compression
+                    self.config.set('options', 'compression', compression)
 
             elif choice == "4":
                 print("\nTesting MySQL connection...")
@@ -761,10 +765,29 @@ class MariaDBManager:
                     print(f"  mysql --host={self.config['mysql']['host']} --port={self.config['mysql']['port']} --user={self.config['mysql']['user']} -p")
 
             elif choice == "5":
-                self.save_config()
-                print("\n✓ Configuration saved!")
-                # Reload config to ensure consistency
-                self.config = self.load_config()
+                print("\n--- Current Configuration ---")
+                print(f"Config file: {self.config_file}")
+                print(f"\n[mysql]")
+                print(f"  host = {self.config['mysql']['host']}")
+                print(f"  port = {self.config['mysql']['port']}")
+                print(f"  user = {self.config['mysql']['user']}")
+                pwd = self.config['mysql'].get('password', '')
+                print(f"  password = {'*' * len(pwd) if pwd else '(empty)'}")
+                print(f"\n[backup_paths]")
+                print(f"  hourly = {self.config['backup_paths']['hourly']}")
+                print(f"  daily = {self.config['backup_paths']['daily']}")
+                print(f"  monthly = {self.config['backup_paths']['monthly']}")
+                print(f"\n[options]")
+                print(f"  compression = {self.config['options'].get('compression', 'yes')}")
+
+            elif choice == "6":
+                if self.save_config():
+                    print(f"\n✓ Configuration saved to {self.config_file}!")
+                    print(f"  File size: {os.path.getsize(self.config_file)} bytes")
+                    # Reload config to ensure consistency
+                    self.config = self.load_config()
+                else:
+                    print(f"\n✗ Error saving configuration to {self.config_file}")
                 break
 
             elif choice == "0":

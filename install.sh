@@ -133,12 +133,16 @@ if [[ "$configure_mysql" =~ ^[Yy]$ ]]; then
     
     # Update config file
     if command -v sed &> /dev/null; then
+        # macOS and BSD sed require '' after -i, Linux doesn't
+        # Using .bak extension works on both
         sed -i.bak "s/^host = .*/host = $mysql_host/" "$CONFIG_FILE"
         sed -i.bak "s/^port = .*/port = $mysql_port/" "$CONFIG_FILE"
         sed -i.bak "s/^user = .*/user = $mysql_user/" "$CONFIG_FILE"
         sed -i.bak "s/^password = .*/password = $mysql_password/" "$CONFIG_FILE"
-        rm -f "$CONFIG_FILE.bak"
+        rm -f "${CONFIG_FILE}.bak"
         echo "✓ MySQL credentials configured"
+    else
+        echo "⚠ sed not found, please edit $CONFIG_FILE manually"
     fi
 fi
 
@@ -165,8 +169,10 @@ if [[ "$configure_dirs" =~ ^[Yy]$ ]]; then
         sed -i.bak "s|^hourly = .*|hourly = $hourly_path|" "$CONFIG_FILE"
         sed -i.bak "s|^daily = .*|daily = $daily_path|" "$CONFIG_FILE"
         sed -i.bak "s|^monthly = .*|monthly = $monthly_path|" "$CONFIG_FILE"
-        rm -f "$CONFIG_FILE.bak"
+        rm -f "${CONFIG_FILE}.bak"
         echo "✓ Backup directories configured"
+    else
+        echo "⚠ sed not found, please edit $CONFIG_FILE manually"
     fi
 fi
 
