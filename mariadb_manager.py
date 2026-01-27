@@ -1422,11 +1422,39 @@ class MariaDBManager:
                     try:
                         idx = int(input("\nEnter backup number to restore: ")) - 1
                         if 0 <= idx < len(backups):
-                            master_host = input("Master host/IP: ").strip()
-                            master_user = input("Master replication user: ").strip()
-                            master_password = getpass.getpass(
-                                "Master replication password: "
-                            )
+                            # Check if config has replication settings
+                            has_config = self.config.has_section('replication')
+                            config_host = self.config['replication'].get('master_host', '') if has_config else ''
+                            config_user = self.config['replication'].get('master_user', '') if has_config else ''
+                            config_pass = self.config['replication'].get('master_password', '') if has_config else ''
+                            config_port = self.config['replication'].get('master_port', '3306') if has_config else '3306'
+                            
+                            if config_host and config_user and config_pass:
+                                print("\n📋 Found saved replication settings in config:")
+                                print(f"   Master: {config_host}:{config_port}")
+                                print(f"   User: {config_user}")
+                                use_config = input("\nUse saved settings? (yes/no) [yes]: ").strip().lower()
+                                
+                                if use_config in ['', 'y', 'yes']:
+                                    # Use config settings
+                                    master_host = None
+                                    master_user = None
+                                    master_password = None
+                                    master_port = None
+                                else:
+                                    # Prompt for manual input
+                                    master_host = input(f"Master host/IP [{config_host}]: ").strip() or None
+                                    master_user = input(f"Master replication user [{config_user}]: ").strip() or None
+                                    master_password = getpass.getpass("Master replication password: ") or None
+                                    master_port = input(f"Master port [{config_port}]: ").strip() or None
+                            else:
+                                # No config or incomplete config, prompt for input
+                                print("\n⚠️  No saved replication settings found in config.")
+                                print("   You can configure these in Settings menu (option 8).\n")
+                                master_host = input("Master host/IP: ").strip() or None
+                                master_user = input("Master replication user: ").strip() or None
+                                master_password = getpass.getpass("Master replication password: ") or None
+                                master_port = input("Master port [3306]: ").strip() or None
 
                             self.restore_backup(
                                 backups[idx]["path"],
@@ -1434,6 +1462,7 @@ class MariaDBManager:
                                 master_host=master_host,
                                 master_user=master_user,
                                 master_password=master_password,
+                                master_port=master_port,
                             )
                         else:
                             print("Invalid backup number")
@@ -1483,11 +1512,15 @@ Examples:
   # Restore as master/standalone
   %(prog)s --restore /path/to/backup
   
-  # Restore as slave
+  # Restore as slave (with config file settings)
+  %(prog)s --restore /path/to/backup --slave
+  
+  # Restore as slave (with explicit master settings)
   %(prog)s --restore /path/to/backup --slave \\
            --master-host 192.168.1.100 \\
            --master-user repl_user \\
-           --master-password secret
+           --master-password secret \\
+           --master-port 3306
   
   # Configuration
   %(prog)s --config /path/to/config.conf
@@ -1523,6 +1556,7 @@ Examples:
     parser.add_argument("--master-host", help="Master host for slave setup")
     parser.add_argument("--master-user", help="Master replication user")
     parser.add_argument("--master-password", help="Master replication password")
+    parser.add_argument("--master-port", help="Master port for slave setup (default: 3306)")
 
     args = parser.parse_args()
 
@@ -1539,19 +1573,13 @@ Examples:
         sys.exit(0)
 
     elif args.restore:
-        if args.slave:
-            if not args.master_host or not args.master_user or not args.master_password:
-                print(
-                    "ERROR: --master-host, --master-user, and --master-password required for slave setup"
-                )
-                sys.exit(1)
-
         success = manager.restore_backup(
             args.restore,
             restore_as_slave=args.slave,
             master_host=args.master_host,
             master_user=args.master_user,
             master_password=args.master_password,
+            master_port=args.master_port if hasattr(args, 'master_port') else None,
         )
         sys.exit(0 if success else 1)
 
