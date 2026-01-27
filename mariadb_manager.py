@@ -116,6 +116,18 @@ class MariaDBManager:
             if not config.has_option('rotation', 'monthly_keep'):
                 config.set('rotation', 'monthly_keep', '12')
 
+            # Replication defaults
+            if not config.has_section('replication'):
+                config.add_section('replication')
+            if not config.has_option('replication', 'master_host'):
+                config.set('replication', 'master_host', '')
+            if not config.has_option('replication', 'master_user'):
+                config.set('replication', 'master_user', '')
+            if not config.has_option('replication', 'master_password'):
+                config.set('replication', 'master_password', '')
+            if not config.has_option('replication', 'master_port'):
+                config.set('replication', 'master_port', '3306')
+
             # Webhook defaults
             if not config.has_section('webhooks'):
                 config.add_section('webhooks')
@@ -146,6 +158,12 @@ class MariaDBManager:
             config.set('rotation', 'hourly_keep', '24')
             config.set('rotation', 'daily_keep', '31')
             config.set('rotation', 'monthly_keep', '12')
+
+            config.add_section('replication')
+            config.set('replication', 'master_host', '')
+            config.set('replication', 'master_user', '')
+            config.set('replication', 'master_password', '')
+            config.set('replication', 'master_port', '3306')
 
             config.add_section('webhooks')
             config.set('webhooks', 'success_url', '')
@@ -699,6 +717,7 @@ class MariaDBManager:
         master_host=None,
         master_user=None,
         master_password=None,
+        master_port=None,
     ):
         """
         Restore a backup
@@ -706,9 +725,10 @@ class MariaDBManager:
         Args:
             backup_path: Path to backup directory
             restore_as_slave: Whether to configure as replication slave
-            master_host: Master server hostname/IP (for slave setup)
-            master_user: Master replication user (for slave setup)
-            master_password: Master replication password (for slave setup)
+            master_host: Master server hostname/IP (for slave setup, defaults to config)
+            master_user: Master replication user (for slave setup, defaults to config)
+            master_password: Master replication password (for slave setup, defaults to config)
+            master_port: Master server port (for slave setup, defaults to config)
         """
         print(f"\n{'='*60}")
         print(f"Restoring Backup")
@@ -752,8 +772,22 @@ class MariaDBManager:
 
         if restore_as_slave:
             print(f"   Mode: SLAVE (replication will be configured)")
+            
+            # Use config defaults if not provided
+            if not master_host and self.config.has_section('replication'):
+                master_host = self.config['replication'].get('master_host', '')
+            if not master_user and self.config.has_section('replication'):
+                master_user = self.config['replication'].get('master_user', '')
+            if not master_password and self.config.has_section('replication'):
+                master_password = self.config['replication'].get('master_password', '')
+            if not master_port and self.config.has_section('replication'):
+                master_port = self.config['replication'].get('master_port', '3306')
+            else:
+                master_port = master_port or '3306'
+            
             if not master_host:
                 print(f"   ERROR: Master host required for slave setup")
+                print(f"   Hint: Set in config file [replication] section or pass as parameter")
                 return False
         else:
             print(f"   Mode: STANDALONE/MASTER")
@@ -884,7 +918,7 @@ class MariaDBManager:
                     MASTER_HOST='{master_host}',
                     MASTER_USER='{master_user}',
                     MASTER_PASSWORD='{master_password}',
-                    MASTER_PORT={self.config['mysql']['port']},
+                    MASTER_PORT={master_port},
                     MASTER_LOG_FILE='{master_status['binlog_file']}',
                     MASTER_LOG_POS={master_status['binlog_position']};
                 """
@@ -955,9 +989,10 @@ class MariaDBManager:
             print("3. Backup Options")
             print("4. Backup Rotation Settings")
             print("5. Webhook Settings")
-            print("6. Test MySQL Connection")
-            print("7. View Current Configuration")
-            print("8. Save and Exit")
+            print("6. Replication Settings (Master for Slave)")
+            print("7. Test MySQL Connection")
+            print("8. View Current Configuration")
+            print("9. Save and Exit")
             print("0. Exit without saving")
 
             choice = input("\nSelect option: ").strip()
@@ -1049,6 +1084,42 @@ class MariaDBManager:
                 print("\n✓ Webhook settings updated in memory (not saved yet)")
 
             elif choice == "6":
+                print("\n--- Replication Settings (Master for Slave) ---")
+                print("Configure master server details for slave replication.")
+                print("Leave empty if this server is standalone or will be a master.\n")
+                
+                if not self.config.has_section('replication'):
+                    self.config.add_section('replication')
+                
+                current_host = self.config['replication'].get('master_host', '')
+                current_user = self.config['replication'].get('master_user', '')
+                current_pass = self.config['replication'].get('master_password', '')
+                current_port = self.config['replication'].get('master_port', '3306')
+                
+                master_host = input(f"Master Host/IP [{current_host}]: ").strip()
+                if master_host:
+                    self.config.set('replication', 'master_host', master_host)
+                    print(f"  → Master host set to: {master_host}")
+                
+                master_user = input(f"Master Replication User [{current_user}]: ").strip()
+                if master_user:
+                    self.config.set('replication', 'master_user', master_user)
+                    print(f"  → Master user set to: {master_user}")
+                
+                master_pass = getpass.getpass(f"Master Password [{'*' * len(current_pass) if current_pass else 'empty'}]: ")
+                if master_pass:
+                    self.config.set('replication', 'master_password', master_pass)
+                    print(f"  → Master password set")
+                
+                master_port = input(f"Master Port [{current_port}]: ").strip()
+                if master_port:
+                    self.config.set('replication', 'master_port', master_port)
+                    print(f"  → Master port set to: {master_port}")
+                
+                print("\n✓ Replication settings updated in memory (not saved yet)")
+                print("   These will be used when restoring as a slave.")
+
+            elif choice == "7":
                 print("\nTesting MySQL connection...")
                 print(f"  Host: {self.config['mysql']['host']}")
                 print(f"  Port: {self.config['mysql']['port']}")
@@ -1062,7 +1133,7 @@ class MariaDBManager:
                     print("\nTip: Test manually with:")
                     print(f"  mysql --host={self.config['mysql']['host']} --port={self.config['mysql']['port']} --user={self.config['mysql']['user']} -p")
 
-            elif choice == "7":
+            elif choice == "8":
                 print("\n--- Current Configuration ---")
                 print(f"Config file: {os.path.abspath(self.config_file)}")
                 print(f"File exists: {os.path.exists(self.config_file)}")
@@ -1087,6 +1158,16 @@ class MariaDBManager:
                 print(f"  hourly_keep = {self.config['rotation'].get('hourly_keep', '24')}")
                 print(f"  daily_keep = {self.config['rotation'].get('daily_keep', '31')}")
                 print(f"  monthly_keep = {self.config['rotation'].get('monthly_keep', '12')}")
+                if self.config.has_section('replication'):
+                    print(f"\n[replication]")
+                    master_host = self.config['replication'].get('master_host', '')
+                    master_user = self.config['replication'].get('master_user', '')
+                    master_pass = self.config['replication'].get('master_password', '')
+                    master_port = self.config['replication'].get('master_port', '3306')
+                    print(f"  master_host = {master_host if master_host else '(not set)'}")
+                    print(f"  master_user = {master_user if master_user else '(not set)'}")
+                    print(f"  master_password = {'*' * len(master_pass) if master_pass else '(not set)'}")
+                    print(f"  master_port = {master_port}")
                 if self.config.has_section('webhooks'):
                     print(f"\n[webhooks]")
                     print(f"  success_url = {self.config['webhooks'].get('success_url', '')}")
@@ -1095,7 +1176,7 @@ class MariaDBManager:
                 print(f"\nPress Enter to continue...")
                 input()
 
-            elif choice == "8":
+            elif choice == "9":
                 if self.save_config():
                     print(f"\n✓ Configuration saved to {self.config_file}!")
                     print(f"  File size: {os.path.getsize(self.config_file)} bytes")

@@ -19,6 +19,14 @@ hourly_keep = 24
 daily_keep = 31
 monthly_keep = 12
 
+[replication]
+# Master server settings for slave replication
+# Leave empty if this is a standalone server or master
+master_host = 
+master_user = 
+master_password = 
+master_port = 3306
+
 [webhooks]
 success_url = 
 failure_url = 
