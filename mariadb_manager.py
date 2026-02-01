@@ -246,7 +246,7 @@ class MariaDBManager:
         return [
             f"--host={self.config['mysql']['host']}",
             f"--user={self.config['mysql']['user']}",
-            f"--password={self.config['mysql']['password']}",
+            f"--password='{self.config['mysql']['password']}'",
             f"--port={self.config['mysql']['port']}",
         ]
 
