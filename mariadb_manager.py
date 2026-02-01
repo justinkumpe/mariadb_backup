@@ -1402,72 +1402,114 @@ class MariaDBManager:
                 self.backup_databases("manual", backup_path if backup_path else None)
 
             elif choice == "5":
-                self.list_backups()
+                # Prompt for backup type
+                print("\nSelect backup type:")
+                print("  1. Hourly")
+                print("  2. Daily")
+                print("  3. Monthly")
+                print("  4. All")
+                type_choice = input("\nSelect type: ").strip()
+                
+                type_map = {"1": "hourly", "2": "daily", "3": "monthly", "4": None}
+                backup_type = type_map.get(type_choice)
+                
+                if type_choice in type_map:
+                    self.list_backups(backup_type)
+                else:
+                    print("Invalid selection")
 
             elif choice == "6":
-                backups = self.list_backups()
-                if backups:
-                    try:
-                        idx = int(input("\nEnter backup number to restore: ")) - 1
-                        if 0 <= idx < len(backups):
-                            self.restore_backup(backups[idx]["path"])
-                        else:
-                            print("Invalid backup number")
-                    except ValueError:
-                        print("Invalid input")
+                # Prompt for backup type
+                print("\nSelect backup type:")
+                print("  1. Hourly")
+                print("  2. Daily")
+                print("  3. Monthly")
+                print("  4. All")
+                type_choice = input("\nSelect type: ").strip()
+                
+                type_map = {"1": "hourly", "2": "daily", "3": "monthly", "4": None}
+                backup_type = type_map.get(type_choice)
+                
+                if type_choice in type_map:
+                    backups = self.list_backups(backup_type)
+                    if backups:
+                        try:
+                            idx = int(input("\nEnter backup number to restore: ")) - 1
+                            if 0 <= idx < len(backups):
+                                self.restore_backup(backups[idx]["path"])
+                            else:
+                                print("Invalid backup number")
+                        except ValueError:
+                            print("Invalid input")
+                else:
+                    print("Invalid selection")
 
             elif choice == "7":
-                backups = self.list_backups()
-                if backups:
-                    try:
-                        idx = int(input("\nEnter backup number to restore: ")) - 1
-                        if 0 <= idx < len(backups):
-                            # Check if config has replication settings
-                            has_config = self.config.has_section('replication')
-                            config_host = self.config['replication'].get('master_host', '') if has_config else ''
-                            config_user = self.config['replication'].get('master_user', '') if has_config else ''
-                            config_pass = self.config['replication'].get('master_password', '') if has_config else ''
-                            config_port = self.config['replication'].get('master_port', '3306') if has_config else '3306'
-                            
-                            if config_host and config_user and config_pass:
-                                print("\n📋 Found saved replication settings in config:")
-                                print(f"   Master: {config_host}:{config_port}")
-                                print(f"   User: {config_user}")
-                                use_config = input("\nUse saved settings? (yes/no) [yes]: ").strip().lower()
+                # Prompt for backup type
+                print("\nSelect backup type:")
+                print("  1. Hourly")
+                print("  2. Daily")
+                print("  3. Monthly")
+                print("  4. All")
+                type_choice = input("\nSelect type: ").strip()
+                
+                type_map = {"1": "hourly", "2": "daily", "3": "monthly", "4": None}
+                backup_type = type_map.get(type_choice)
+                
+                if type_choice in type_map:
+                    backups = self.list_backups(backup_type)
+                    if backups:
+                        try:
+                            idx = int(input("\nEnter backup number to restore: ")) - 1
+                            if 0 <= idx < len(backups):
+                                # Check if config has replication settings
+                                has_config = self.config.has_section('replication')
+                                config_host = self.config['replication'].get('master_host', '') if has_config else ''
+                                config_user = self.config['replication'].get('master_user', '') if has_config else ''
+                                config_pass = self.config['replication'].get('master_password', '') if has_config else ''
+                                config_port = self.config['replication'].get('master_port', '3306') if has_config else '3306'
                                 
-                                if use_config in ['', 'y', 'yes']:
-                                    # Use config settings
-                                    master_host = None
-                                    master_user = None
-                                    master_password = None
-                                    master_port = None
+                                if config_host and config_user and config_pass:
+                                    print("\n📋 Found saved replication settings in config:")
+                                    print(f"   Master: {config_host}:{config_port}")
+                                    print(f"   User: {config_user}")
+                                    use_config = input("\nUse saved settings? (yes/no) [yes]: ").strip().lower()
+                                    
+                                    if use_config in ['', 'y', 'yes']:
+                                        # Use config settings
+                                        master_host = None
+                                        master_user = None
+                                        master_password = None
+                                        master_port = None
+                                    else:
+                                        # Prompt for manual input
+                                        master_host = input(f"Master host/IP [{config_host}]: ").strip() or None
+                                        master_user = input(f"Master replication user [{config_user}]: ").strip() or None
+                                        master_password = getpass.getpass("Master replication password: ") or None
+                                        master_port = input(f"Master port [{config_port}]: ").strip() or None
                                 else:
-                                    # Prompt for manual input
-                                    master_host = input(f"Master host/IP [{config_host}]: ").strip() or None
-                                    master_user = input(f"Master replication user [{config_user}]: ").strip() or None
+                                    # No config or incomplete config, prompt for input
+                                    print("\n⚠️  No saved replication settings found in config.")
+                                    print("   You can configure these in Settings menu (option 8).\n")
+                                    master_host = input("Master host/IP: ").strip() or None
+                                    master_user = input("Master replication user: ").strip() or None
                                     master_password = getpass.getpass("Master replication password: ") or None
-                                    master_port = input(f"Master port [{config_port}]: ").strip() or None
-                            else:
-                                # No config or incomplete config, prompt for input
-                                print("\n⚠️  No saved replication settings found in config.")
-                                print("   You can configure these in Settings menu (option 8).\n")
-                                master_host = input("Master host/IP: ").strip() or None
-                                master_user = input("Master replication user: ").strip() or None
-                                master_password = getpass.getpass("Master replication password: ") or None
-                                master_port = input("Master port [3306]: ").strip() or None
+                                    master_port = input("Master port [3306]: ").strip() or None
 
-                            self.restore_backup(
-                                backups[idx]["path"],
-                                restore_as_slave=True,
-                                master_host=master_host,
-                                master_user=master_user,
-                                master_password=master_password,
-                                master_port=master_port,
-                            )
-                        else:
-                            print("Invalid backup number")
-                    except ValueError:
-                        print("Invalid input")
+                                self.restore_backup(
+                                    backups[idx]["path"],
+                                    restore_as_slave=True,
+                                    master_host=master_host,
+                                    master_user=master_user,
+                                    master_password=master_password,
+                                    master_port=master_port,
+                                )
+                            else:
+                                print("Invalid backup number")
+                        except ValueError:
+                            print("Invalid input")
+                else:
+                    print("Invalid selection")
 
             elif choice == "8":
                 self.configure_settings()
