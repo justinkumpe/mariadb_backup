@@ -267,27 +267,54 @@ class MariaDBManager:
             if not self.config.get('mysql', 'password', fallback=''):
                 print("WARNING: MySQL password is empty")
             
+            # Show connection method being used
+            host = self.config['mysql']['host']
+            user = self.config['mysql']['user']
+            if host.lower() == 'localhost':
+                print(f"Attempting connection as {user} via Unix socket...")
+            else:
+                port = self.config['mysql']['port']
+                print(f"Attempting connection to {host}:{port} as {user}...")
+            
+            # Check if mysql client exists
+            check_mysql = subprocess.run(['which', 'mysql'], capture_output=True, text=True)
+            if check_mysql.returncode != 0:
+                print("ERROR: 'mysql' command not found. Please install MySQL/MariaDB client.")
+                return False
+            
             cmd = ["mysql"] + self.get_mysql_connection_args() + ["-e", "SELECT 1;"]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
             
             if result.returncode != 0:
-                # Don't print stderr as it may contain password in some error messages
-                host = self.config['mysql']['host']
-                user = self.config['mysql']['user']
+                # Show stderr but filter out password
+                error_msg = result.stderr
+                if error_msg:
+                    # Replace password in error messages
+                    password = self.config['mysql']['password']
+                    if password:
+                        error_msg = error_msg.replace(password, '***')
+                    print(f"Connection error: {error_msg.strip()}")
+                
                 if host.lower() == 'localhost':
-                    print(f"Connection error: Could not connect to MySQL as {user} via Unix socket")
+                    print(f"Could not connect to MySQL as {user} via Unix socket")
+                    print("Try checking: sudo systemctl status mariadb (or mysql)")
                 else:
-                    port = self.config['mysql']['port']
-                    print(f"Connection error: Could not connect to MySQL at {host}:{port} as {user}")
-                print("Check your credentials and ensure MySQL is running.")
+                    print(f"Could not connect to MySQL at {host}:{port} as {user}")
+                print("Verify MySQL is running and credentials are correct.")
                 
             return result.returncode == 0
         except subprocess.TimeoutExpired:
             print(f"Connection test failed: Connection timed out after 10 seconds")
-            print("This may indicate MySQL is not running or is not accessible.")
+            if host.lower() == 'localhost':
+                print("MySQL client is hanging. Possible causes:")
+                print("  - MySQL/MariaDB service is not running")
+                print("  - Unix socket file is missing or inaccessible")
+                print("  - Try: sudo systemctl status mariadb")
+            else:
+                print("MySQL server is not responding. Verify it's running and accessible.")
             return False
         except Exception as e:
-            print(f"Connection test failed: {type(e).__name__}")
+            print(f"Connection test failed: {type(e).__name__}: {str(e)}")
             return False
 
     def notify_backup_webhook(self, success, backup_type, backup_dir, message=None):
