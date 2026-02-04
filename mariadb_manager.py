@@ -243,12 +243,21 @@ class MariaDBManager:
 
     def get_mysql_connection_args(self):
         """Get MySQL connection arguments"""
-        return [
-            f"--host={self.config['mysql']['host']}",
+        args = []
+        
+        # Don't pass host parameter for localhost to use Unix socket connection
+        # This avoids IPv6 issues where localhost might resolve to ::1
+        host = self.config['mysql']['host']
+        if host.lower() != 'localhost':
+            args.append(f"--host={host}")
+        
+        args.extend([
             f"--user={self.config['mysql']['user']}",
             f"--password={self.config['mysql']['password']}",
             f"--port={self.config['mysql']['port']}",
-        ]
+        ])
+        
+        return args
 
     def test_connection(self):
         """Test MySQL connection"""
