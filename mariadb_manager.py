@@ -335,8 +335,9 @@ class MariaDBManager:
             
             # Add connection timeout and skip-reconnect to prevent hanging
             # Use host_to_use to potentially override localhost with 127.0.0.1
+            # --no-defaults prevents reading config files that might cause hanging
             cmd = (
-                ["mysql"] 
+                ["mysql", "--no-defaults"]
                 + self.get_mysql_connection_args(host_override=host_to_use if use_tcp else None)
                 + [
                     "--connect-timeout=5",
