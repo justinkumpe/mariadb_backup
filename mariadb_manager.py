@@ -309,15 +309,23 @@ class MariaDBManager:
                     sanitized_cmd.append(arg)
             print(f"  Command: {' '.join(sanitized_cmd)}")
             
-            # Use stdin=DEVNULL to prevent hanging on any interactive prompts
-            # Also disable password warnings with MYSQL_PWD env var approach is deprecated,
-            # but using --password= can cause warnings that hang subprocess
+            # Use MYSQL_PWD environment variable to avoid password warnings that might cause hanging
+            # and stdin=DEVNULL to prevent any interactive prompts
+            env = os.environ.copy()
+            env['MYSQL_PWD'] = self.config['mysql']['password']
+            
+            # Remove password from command since we're using env var
+            cmd_without_pwd = [arg for arg in cmd if not arg.startswith('--password=')]
+            
+            print(f"  Using MYSQL_PWD environment variable for password")
+            
             result = subprocess.run(
-                cmd, 
+                cmd_without_pwd, 
                 capture_output=True, 
                 text=True, 
                 timeout=10,
-                stdin=subprocess.DEVNULL
+                stdin=subprocess.DEVNULL,
+                env=env
             )
             
             if result.returncode != 0:
