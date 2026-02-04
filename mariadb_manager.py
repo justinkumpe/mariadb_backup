@@ -241,13 +241,19 @@ class MariaDBManager:
             traceback.print_exc()
             return False
 
-    def get_mysql_connection_args(self):
-        """Get MySQL connection arguments"""
+    def get_mysql_connection_args(self, host_override=None):
+        """Get MySQL connection arguments
+        
+        Args:
+            host_override: If provided, use this host instead of config host
+        """
         args = []
+        
+        # Use override if provided, otherwise use config
+        host = host_override if host_override else self.config['mysql']['host']
         
         # Don't pass host parameter for localhost to use Unix socket connection
         # This avoids IPv6 issues where localhost might resolve to ::1
-        host = self.config['mysql']['host']
         if host.lower() != 'localhost':
             args.append(f"--host={host}")
             # Only add port when using TCP/IP connection (not Unix socket)
@@ -270,7 +276,36 @@ class MariaDBManager:
             # Show connection method being used
             host = self.config['mysql']['host']
             user = self.config['mysql']['user']
+            
+            # Try TCP/IP to 127.0.0.1 if localhost to avoid socket issues
+            use_tcp = False
             if host.lower() == 'localhost':
+                print(f"Note: localhost specified - will try TCP/IP to 127.0.0.1 instead of Unix socket")
+                print(f"      (Unix sockets can have permission/SELinux issues in subprocesses)")
+                host_to_use = '127.0.0.1'
+                use_tcp = True
+                
+                # Still check for socket file for informational purposes
+                socket_locations = [
+                    '/var/run/mysqld/mysqld.sock',
+                    '/var/lib/mysql/mysql.sock',
+                    '/tmp/mysql.sock',
+                    '/run/mysqld/mysqld.sock',
+                ]
+                socket_found = False
+                for sock in socket_locations:
+                    if os.path.exists(sock):
+                        print(f"  Socket exists: {sock}")
+                        socket_found = True
+                        break
+                if not socket_found:
+                    print("  Warning: Standard MySQL socket file not found")
+            else:
+                host_to_use = host
+                
+            if use_tcp:
+                print(f"Attempting connection to {host_to_use}:{self.config['mysql']['port']} as {user}...")
+            elif host.lower() == 'localhost':
                 print(f"Attempting connection as {user} via Unix socket...")
                 
                 # Check for common socket file locations
@@ -299,9 +334,10 @@ class MariaDBManager:
                 return False
             
             # Add connection timeout and skip-reconnect to prevent hanging
+            # Use host_to_use to potentially override localhost with 127.0.0.1
             cmd = (
                 ["mysql"] 
-                + self.get_mysql_connection_args() 
+                + self.get_mysql_connection_args(host_override=host_to_use if use_tcp else None)
                 + [
                     "--connect-timeout=5",
                     "--skip-reconnect",
