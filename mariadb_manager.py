@@ -276,16 +276,13 @@ class MariaDBManager:
             # Show connection method being used
             host = self.config['mysql']['host']
             user = self.config['mysql']['user']
-            
-            # Try TCP/IP to 127.0.0.1 if localhost to avoid socket issues
+            host_to_use = host
             use_tcp = False
+            
             if host.lower() == 'localhost':
-                print(f"Note: localhost specified - will try TCP/IP to 127.0.0.1 instead of Unix socket")
-                print(f"      (Unix sockets can have permission/SELinux issues in subprocesses)")
-                host_to_use = '127.0.0.1'
-                use_tcp = True
+                print(f"Attempting connection as {user} via Unix socket...")
                 
-                # Still check for socket file for informational purposes
+                # Check for socket file
                 socket_locations = [
                     '/var/run/mysqld/mysqld.sock',
                     '/var/lib/mysql/mysql.sock',
@@ -295,12 +292,13 @@ class MariaDBManager:
                 socket_found = False
                 for sock in socket_locations:
                     if os.path.exists(sock):
-                        print(f"  Socket exists: {sock}")
+                        print(f"  Found socket: {sock}")
                         socket_found = True
                         break
                 if not socket_found:
                     print("  Warning: Standard MySQL socket file not found")
             else:
+                use_tcp = True
                 host_to_use = host
                 
             if use_tcp:
@@ -334,12 +332,13 @@ class MariaDBManager:
                 return False
             
             # Add connection timeout and skip-reconnect to prevent hanging
-            # Use host_to_use to potentially override localhost with 127.0.0.1
             # --no-defaults prevents reading config files that might cause hanging
+            # --skip-ssl avoids TLS handshake issues that can cause errors or hanging
             cmd = (
                 ["mysql", "--no-defaults"]
-                + self.get_mysql_connection_args(host_override=host_to_use if use_tcp else None)
+                + self.get_mysql_connection_args(host_override=None)  # Use config host (localhost for socket)
                 + [
+                    "--skip-ssl",
                     "--connect-timeout=5",
                     "--skip-reconnect",
                     "--batch",
