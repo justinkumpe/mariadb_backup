@@ -250,11 +250,12 @@ class MariaDBManager:
         host = self.config['mysql']['host']
         if host.lower() != 'localhost':
             args.append(f"--host={host}")
+            # Only add port when using TCP/IP connection (not Unix socket)
+            args.append(f"--port={self.config['mysql']['port']}")
         
         args.extend([
             f"--user={self.config['mysql']['user']}",
             f"--password={self.config['mysql']['password']}",
-            f"--port={self.config['mysql']['port']}",
         ])
         
         return args
@@ -270,11 +271,23 @@ class MariaDBManager:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
             
             if result.returncode != 0:
-                print(f"Connection error: {result.stderr}")
+                # Don't print stderr as it may contain password in some error messages
+                host = self.config['mysql']['host']
+                user = self.config['mysql']['user']
+                if host.lower() == 'localhost':
+                    print(f"Connection error: Could not connect to MySQL as {user} via Unix socket")
+                else:
+                    port = self.config['mysql']['port']
+                    print(f"Connection error: Could not connect to MySQL at {host}:{port} as {user}")
+                print("Check your credentials and ensure MySQL is running.")
                 
             return result.returncode == 0
+        except subprocess.TimeoutExpired:
+            print(f"Connection test failed: Connection timed out after 10 seconds")
+            print("This may indicate MySQL is not running or is not accessible.")
+            return False
         except Exception as e:
-            print(f"Connection test failed: {e}")
+            print(f"Connection test failed: {type(e).__name__}")
             return False
 
     def notify_backup_webhook(self, success, backup_type, backup_dir, message=None):
