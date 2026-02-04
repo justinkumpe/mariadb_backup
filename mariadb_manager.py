@@ -298,7 +298,19 @@ class MariaDBManager:
                 print("ERROR: 'mysql' command not found. Please install MySQL/MariaDB client.")
                 return False
             
-            cmd = ["mysql"] + self.get_mysql_connection_args() + ["-e", "SELECT 1;"]
+            # Add connection timeout and skip-reconnect to prevent hanging
+            cmd = (
+                ["mysql"] 
+                + self.get_mysql_connection_args() 
+                + [
+                    "--connect-timeout=5",
+                    "--skip-reconnect",
+                    "--batch",
+                    "--skip-column-names",
+                    "-e", 
+                    "SELECT 1;"
+                ]
+            )
             
             # Debug: show sanitized command
             sanitized_cmd = []
@@ -318,6 +330,7 @@ class MariaDBManager:
             cmd_without_pwd = [arg for arg in cmd if not arg.startswith('--password=')]
             
             print(f"  Using MYSQL_PWD environment variable for password")
+            print(f"  Connecting with 5 second MySQL timeout...")
             
             result = subprocess.run(
                 cmd_without_pwd, 
