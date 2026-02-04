@@ -671,21 +671,37 @@ class MariaDBManager:
         for btype in types_to_check:
             path = self.config["backup_paths"].get(btype)
             if path and os.path.exists(path):
-                for item in os.listdir(path):
-                    item_path = os.path.join(path, item)
-                    # Match both old and new naming patterns for backwards compatibility
-                    if os.path.isdir(item_path) and (item.startswith(f"backup_{btype}_") or (item.startswith("backup_") and not any(item.startswith(f"backup_{t}_") for t in ["hourly", "daily", "monthly", "manual"]))):
-                        manifest_file = os.path.join(item_path, "MANIFEST.txt")
-                        if os.path.exists(manifest_file):
-                            mtime = os.path.getmtime(item_path)
-                            all_backups.append(
-                                {
-                                    "type": btype,
-                                    "name": item,
-                                    "path": item_path,
-                                    "mtime": mtime,
-                                }
-                            )
+                try:
+                    items = os.listdir(path)
+                except (OSError, IOError, PermissionError) as e:
+                    print(f"Warning: Could not read {btype} backup directory {path}: {e}")
+                    continue
+                    
+                for item in items:
+                    try:
+                        item_path = os.path.join(path, item)
+                        # Skip if we can't access the item (broken symlinks, permission issues)
+                        if not os.path.exists(item_path):
+                            continue
+                            
+                        # Match both old and new naming patterns for backwards compatibility
+                        if os.path.isdir(item_path) and (item.startswith(f"backup_{btype}_") or (item.startswith("backup_") and not any(item.startswith(f"backup_{t}_") for t in ["hourly", "daily", "monthly", "manual"]))):
+                            manifest_file = os.path.join(item_path, "MANIFEST.txt")
+                            if os.path.exists(manifest_file):
+                                mtime = os.path.getmtime(item_path)
+                                all_backups.append(
+                                    {
+                                        "type": btype,
+                                        "name": item,
+                                        "path": item_path,
+                                        "mtime": mtime,
+                                    }
+                                )
+                    except (OSError, IOError, PermissionError) as e:
+                        # Skip items we can't access
+                        print(f"Warning: Could not access backup item {item}: {e}")
+                        continue
+
 
         if not all_backups:
             print("No backups found.")
@@ -696,15 +712,30 @@ class MariaDBManager:
 
         for idx, backup in enumerate(all_backups, 1):
             backup_time = datetime.datetime.fromtimestamp(backup["mtime"])
-            size = sum(
-                os.path.getsize(os.path.join(backup["path"], f))
-                for f in os.listdir(backup["path"])
-                if os.path.isfile(os.path.join(backup["path"], f))
-            )
+            
+            # Calculate size with error handling
+            size = 0
+            size_error = False
+            try:
+                for f in os.listdir(backup["path"]):
+                    file_path = os.path.join(backup["path"], f)
+                    try:
+                        if os.path.isfile(file_path) and not os.path.islink(file_path):
+                            size += os.path.getsize(file_path)
+                    except (OSError, IOError) as e:
+                        # Skip files we can't read
+                        size_error = True
+                        continue
+            except (OSError, IOError) as e:
+                size_error = True
+                print(f"   Warning: Could not read some files in backup directory: {e}")
 
             print(f"{idx}. [{backup['type'].upper()}] {backup['name']}")
             print(f"   Time: {backup_time.strftime('%Y-%m-%d %H:%M:%S')}")
-            print(f"   Size: {size:,} bytes ({size/1024/1024:.2f} MB)")
+            if size_error:
+                print(f"   Size: ~{size:,} bytes (~{size/1024/1024:.2f} MB) [incomplete]")
+            else:
+                print(f"   Size: {size:,} bytes ({size/1024/1024:.2f} MB)")
             print(f"   Path: {backup['path']}")
             print()
 
