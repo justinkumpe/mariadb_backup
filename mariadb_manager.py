@@ -272,6 +272,22 @@ class MariaDBManager:
             user = self.config['mysql']['user']
             if host.lower() == 'localhost':
                 print(f"Attempting connection as {user} via Unix socket...")
+                
+                # Check for common socket file locations
+                socket_locations = [
+                    '/var/run/mysqld/mysqld.sock',
+                    '/var/lib/mysql/mysql.sock',
+                    '/tmp/mysql.sock',
+                    '/run/mysqld/mysqld.sock',
+                ]
+                socket_found = False
+                for sock in socket_locations:
+                    if os.path.exists(sock):
+                        print(f"  Found socket: {sock}")
+                        socket_found = True
+                        break
+                if not socket_found:
+                    print("  Warning: Standard MySQL socket file not found")
             else:
                 port = self.config['mysql']['port']
                 print(f"Attempting connection to {host}:{port} as {user}...")
@@ -283,6 +299,16 @@ class MariaDBManager:
                 return False
             
             cmd = ["mysql"] + self.get_mysql_connection_args() + ["-e", "SELECT 1;"]
+            
+            # Debug: show sanitized command
+            sanitized_cmd = []
+            for arg in cmd:
+                if '--password=' in arg:
+                    sanitized_cmd.append('--password=***')
+                else:
+                    sanitized_cmd.append(arg)
+            print(f"  Command: {' '.join(sanitized_cmd)}")
+            
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
             
             if result.returncode != 0:
