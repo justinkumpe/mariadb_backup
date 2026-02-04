@@ -309,7 +309,16 @@ class MariaDBManager:
                     sanitized_cmd.append(arg)
             print(f"  Command: {' '.join(sanitized_cmd)}")
             
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            # Use stdin=DEVNULL to prevent hanging on any interactive prompts
+            # Also disable password warnings with MYSQL_PWD env var approach is deprecated,
+            # but using --password= can cause warnings that hang subprocess
+            result = subprocess.run(
+                cmd, 
+                capture_output=True, 
+                text=True, 
+                timeout=10,
+                stdin=subprocess.DEVNULL
+            )
             
             if result.returncode != 0:
                 # Show stderr but filter out password
@@ -498,7 +507,7 @@ class MariaDBManager:
         try:
             with open(db_backup_file, "w") as f:
                 result = subprocess.run(
-                    mysqldump_cmd, stdout=f, stderr=subprocess.PIPE, text=True
+                    mysqldump_cmd, stdout=f, stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL
                 )
 
             if result.returncode != 0:
@@ -528,7 +537,7 @@ class MariaDBManager:
                     "SELECT DISTINCT user, host FROM mysql.user WHERE user NOT IN ('mysql.sys', 'mariadb.sys', 'mysql.infoschema', 'mysql.session');",
                 ]
             )
-            result = subprocess.run(get_users_cmd, capture_output=True, text=True)
+            result = subprocess.run(get_users_cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
 
             with open(users_file, "w") as f:
                 f.write("-- Users and Grants Backup\n")
@@ -552,7 +561,7 @@ class MariaDBManager:
                                 ]
                             )
                             create_result = subprocess.run(
-                                show_create_cmd, capture_output=True, text=True
+                                show_create_cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL
                             )
                             if create_result.returncode == 0:
                                 f.write(f"{create_result.stdout.strip()};\n")
@@ -569,7 +578,7 @@ class MariaDBManager:
                                 ]
                             )
                             grants_result = subprocess.run(
-                                show_grants_cmd, capture_output=True, text=True
+                                show_grants_cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL
                             )
                             if grants_result.returncode == 0:
                                 for grant_line in grants_result.stdout.strip().split(
@@ -603,7 +612,7 @@ class MariaDBManager:
                 + self.get_mysql_connection_args()
                 + ["-N", "-B", "-e", "SELECT @@server_id;"]
             )
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
             if result.returncode == 0:
                 replication_info["server_id"] = result.stdout.strip()
         except:
@@ -616,7 +625,7 @@ class MariaDBManager:
                 + self.get_mysql_connection_args()
                 + ["-N", "-B", "-e", "SELECT @@server_uuid;"]
             )
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
             if result.returncode == 0:
                 replication_info["server_uuid"] = result.stdout.strip()
         except:
@@ -1009,13 +1018,13 @@ class MariaDBManager:
                 cmd = (
                     ["mysql"] + self.get_mysql_connection_args() + ["-e", "STOP SLAVE;"]
                 )
-                subprocess.run(cmd, capture_output=True)
+                subprocess.run(cmd, capture_output=True, stdin=subprocess.DEVNULL)
 
                 print("  → Resetting slave configuration...")
                 cmd = (
                     ["mysql"] + self.get_mysql_connection_args() + ["-e", "RESET SLAVE ALL;"]
                 )
-                subprocess.run(cmd, capture_output=True)
+                subprocess.run(cmd, capture_output=True, stdin=subprocess.DEVNULL)
 
                 # Configure slave
                 print("  → Configuring master connection...")
@@ -1034,7 +1043,7 @@ class MariaDBManager:
                     + self.get_mysql_connection_args()
                     + ["-e", change_master_sql]
                 )
-                result = subprocess.run(cmd, capture_output=True, text=True)
+                result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
 
                 if result.returncode != 0:
                     print(f"ERROR: Failed to configure slave: {result.stderr}")
@@ -1051,7 +1060,7 @@ class MariaDBManager:
                     + self.get_mysql_connection_args()
                     + ["-e", "START SLAVE;"]
                 )
-                result = subprocess.run(cmd, capture_output=True, text=True)
+                result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
 
                 if result.returncode != 0:
                     print(f"ERROR: Failed to start slave: {result.stderr}")
@@ -1064,7 +1073,7 @@ class MariaDBManager:
                     + self.get_mysql_connection_args()
                     + ["-e", "SHOW SLAVE STATUS\\G"]
                 )
-                result = subprocess.run(cmd, capture_output=True, text=True)
+                result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
 
                 print("✓ Slave replication configured")
                 print("\nSlave Status:")
