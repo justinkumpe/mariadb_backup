@@ -262,9 +262,31 @@ class MariaDBManager:
         args.extend([
             f"--user={self.config['mysql']['user']}",
             f"--password={self.config['mysql']['password']}",
+            "--max-allowed-packet=1G",
         ])
         
         return args
+
+    def _format_restore_error(self, stderr):
+        """Format restore errors to avoid printing huge SQL statements"""
+        if not stderr:
+            return "Unknown MySQL error"
+
+        cleaned = stderr.strip()
+        packet_hint = ""
+        if "max_allowed_packet" in cleaned.lower() or "packet bigger than" in cleaned.lower():
+            packet_hint = "\nHint: Increase server max_allowed_packet in MariaDB config and retry restore."
+
+        if len(cleaned) <= 2000:
+            return f"{cleaned}{packet_hint}"
+
+        head = cleaned[:800]
+        tail = cleaned[-800:]
+        return (
+            f"{head}\n... [error output truncated] ...\n{tail}"
+            f"\nHint: Restore failed while replaying a very large statement."
+            f" Verify MariaDB server max_allowed_packet is high enough (for example 256M-1G).{packet_hint}"
+        )
 
     def test_connection(self):
         """Test MySQL connection"""
@@ -992,7 +1014,7 @@ class MariaDBManager:
                 _, stderr = mysql.communicate()
 
                 if mysql.returncode != 0:
-                    print(f"ERROR: Database restore failed: {stderr}")
+                    print(f"ERROR: Database restore failed: {self._format_restore_error(stderr)}")
                     return False
             else:
                 # Direct restore
@@ -1006,7 +1028,7 @@ class MariaDBManager:
                     _, stderr = mysql.communicate()
 
                     if mysql.returncode != 0:
-                        print(f"ERROR: Database restore failed: {stderr}")
+                        print(f"ERROR: Database restore failed: {self._format_restore_error(stderr)}")
                         return False
 
             print("✓ Databases restored successfully")
