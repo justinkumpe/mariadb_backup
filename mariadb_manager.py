@@ -15,6 +15,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 
@@ -287,6 +288,84 @@ class MariaDBManager:
             f"\nHint: Restore failed while replaying a very large statement."
             f" Verify MariaDB server max_allowed_packet is high enough (for example 256M-1G).{packet_hint}"
         )
+
+    def _get_server_packet_sizes(self):
+        """Get global/session max_allowed_packet values in bytes."""
+        cmd = (
+            ["mysql"]
+            + self.get_mysql_connection_args()
+            + ["-N", "-B", "-e", "SELECT @@global.max_allowed_packet, @@session.max_allowed_packet;"]
+        )
+        result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        if result.returncode != 0 or not result.stdout.strip():
+            return None, None
+
+        parts = result.stdout.strip().split("\t")
+        if len(parts) < 2:
+            return None, None
+
+        try:
+            return int(parts[0]), int(parts[1])
+        except ValueError:
+            return None, None
+
+    def _try_raise_global_packet_size(self, target_bytes=1073741824):
+        """Best-effort attempt to raise global max_allowed_packet."""
+        cmd = (
+            ["mysql"]
+            + self.get_mysql_connection_args()
+            + ["-e", f"SET GLOBAL max_allowed_packet={target_bytes};"]
+        )
+        result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        return result.returncode == 0
+
+    def _run_restore_from_file(self, sql_file):
+        """Run mysql restore from an existing SQL file path."""
+        with open(sql_file, "r") as f:
+            mysql = subprocess.Popen(
+                ["mysql"] + self.get_mysql_connection_args(),
+                stdin=f,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            _, stderr = mysql.communicate()
+            return mysql.returncode, stderr
+
+    def _create_filtered_restore_file(self, db_file, is_compressed, skip_table):
+        """Create temporary SQL file with INSERTs for selected table removed."""
+        temp_sql = tempfile.NamedTemporaryFile(mode="w", suffix=".sql", delete=False)
+        temp_path = temp_sql.name
+        temp_sql.close()
+
+        skip_prefix = f"INSERT INTO `{skip_table}`"
+        skipped_lines = 0
+
+        if is_compressed:
+            gunzip = subprocess.Popen(
+                ["gunzip", "-c", db_file],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            source = gunzip.stdout
+        else:
+            gunzip = None
+            source = open(db_file, "r")
+
+        try:
+            with open(temp_path, "w") as out:
+                for line in source:
+                    if line.startswith(skip_prefix):
+                        skipped_lines += 1
+                        continue
+                    out.write(line)
+        finally:
+            if source:
+                source.close()
+            if gunzip:
+                gunzip.wait()
+
+        return temp_path, skipped_lines
 
     def test_connection(self):
         """Test MySQL connection"""
@@ -996,8 +1075,29 @@ class MariaDBManager:
             print("ERROR: Cannot connect to MySQL. Check your credentials.")
             return False
 
+        # Preflight packet size check (server-side)
+        global_packet, session_packet = self._get_server_packet_sizes()
+        if global_packet and session_packet:
+            print(
+                f"Server packet limits: global={global_packet} bytes, session={session_packet} bytes"
+            )
+            if global_packet < 268435456:
+                print(
+                    "WARNING: Server global max_allowed_packet is below 256MB; large BLOB rows may fail during restore."
+                )
+                if self._try_raise_global_packet_size(1073741824):
+                    new_global, new_session = self._get_server_packet_sizes()
+                    print(
+                        f"✓ Raised global max_allowed_packet: global={new_global} bytes, session={new_session} bytes"
+                    )
+                else:
+                    print(
+                        "WARNING: Could not raise global max_allowed_packet automatically (insufficient privileges or server restriction)."
+                    )
+
         # 1. Restore databases
         print("\n[1/3] Restoring databases...")
+        filtered_temp = None
         try:
             if is_compressed:
                 # Decompress and pipe to mysql
@@ -1014,27 +1114,63 @@ class MariaDBManager:
                 _, stderr = mysql.communicate()
 
                 if mysql.returncode != 0:
-                    print(f"ERROR: Database restore failed: {self._format_restore_error(stderr)}")
-                    return False
+                    lowered = (stderr or "").lower()
+                    if "server has gone away" in lowered and "bw_jobs_cache" in lowered:
+                        print(
+                            "WARNING: Restore failed on oversized bw_jobs_cache row; retrying while skipping bw_jobs_cache INSERTs..."
+                        )
+                        filtered_temp, skipped = self._create_filtered_restore_file(
+                            db_file, is_compressed, "bw_jobs_cache"
+                        )
+                        code, retry_stderr = self._run_restore_from_file(filtered_temp)
+                        if code != 0:
+                            print(
+                                f"ERROR: Database restore failed after fallback retry: {self._format_restore_error(retry_stderr)}"
+                            )
+                            return False
+                        print(
+                            f"✓ Databases restored with fallback (skipped {skipped} bw_jobs_cache INSERT statement(s))"
+                        )
+                    else:
+                        print(f"ERROR: Database restore failed: {self._format_restore_error(stderr)}")
+                        return False
             else:
                 # Direct restore
-                with open(db_file, "r") as f:
-                    mysql = subprocess.Popen(
-                        ["mysql"] + self.get_mysql_connection_args(),
-                        stdin=f,
-                        stderr=subprocess.PIPE,
-                        text=True,
-                    )
-                    _, stderr = mysql.communicate()
+                code, stderr = self._run_restore_from_file(db_file)
 
-                    if mysql.returncode != 0:
+                if code != 0:
+                    lowered = (stderr or "").lower()
+                    if "server has gone away" in lowered and "bw_jobs_cache" in lowered:
+                        print(
+                            "WARNING: Restore failed on oversized bw_jobs_cache row; retrying while skipping bw_jobs_cache INSERTs..."
+                        )
+                        filtered_temp, skipped = self._create_filtered_restore_file(
+                            db_file, is_compressed, "bw_jobs_cache"
+                        )
+                        code, retry_stderr = self._run_restore_from_file(filtered_temp)
+                        if code != 0:
+                            print(
+                                f"ERROR: Database restore failed after fallback retry: {self._format_restore_error(retry_stderr)}"
+                            )
+                            return False
+                        print(
+                            f"✓ Databases restored with fallback (skipped {skipped} bw_jobs_cache INSERT statement(s))"
+                        )
+                    else:
                         print(f"ERROR: Database restore failed: {self._format_restore_error(stderr)}")
                         return False
 
-            print("✓ Databases restored successfully")
+            if not filtered_temp:
+                print("✓ Databases restored successfully")
         except Exception as e:
             print(f"ERROR: Database restore failed: {e}")
             return False
+        finally:
+            if filtered_temp and os.path.exists(filtered_temp):
+                try:
+                    os.remove(filtered_temp)
+                except OSError:
+                    pass
 
         # 2. Restore users (optional)
         print("\n[2/3] Restoring users and grants...")
