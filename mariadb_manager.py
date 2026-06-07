@@ -358,20 +358,17 @@ class MariaDBManager:
         state = {
             "read_only": self._get_global_variable("read_only"),
             "event_scheduler": self._get_global_variable("event_scheduler"),
-            "super_read_only": self._get_global_variable("super_read_only"),
+            "offline_mode": self._get_global_variable("offline_mode"),
         }
 
         ok, err = self._set_global_variable("read_only", "ON")
         if not ok:
             return False, state, f"Failed to set read_only=ON: {err or 'unknown error'}"
 
-        # super_read_only is not available on all MariaDB versions; best effort.
-        if state["super_read_only"] is not None:
-            ok, err = self._set_global_variable("super_read_only", "ON")
-            if not ok:
-                print(
-                    f"WARNING: Could not set super_read_only=ON: {err or 'unknown error'}"
-                )
+        print(
+            "INFO: Protected restore uses read_only/event_scheduler/offline_mode where available. "
+            "Privileged users may still write during restore on some MariaDB setups."
+        )
 
         # Stop events from mutating data during restore.
         ok, err = self._set_global_variable("event_scheduler", "OFF")
@@ -380,6 +377,14 @@ class MariaDBManager:
                 f"WARNING: Could not set event_scheduler=OFF: {err or 'unknown error'}"
             )
 
+        # Best effort: where available, offline_mode blocks normal client logins.
+        if state["offline_mode"] is not None:
+            ok, err = self._set_global_variable("offline_mode", "ON")
+            if not ok:
+                print(
+                    f"WARNING: Could not set offline_mode=ON: {err or 'unknown error'}"
+                )
+
         return True, state, None
 
     def _disable_protected_restore(self, previous_state):
@@ -387,7 +392,7 @@ class MariaDBManager:
         if not previous_state:
             return
 
-        # Restore scheduler first, then read-only protections.
+        # Restore scheduler/login controls first, then read-only protections.
         old_event = previous_state.get("event_scheduler")
         if old_event is not None:
             desired = self._normalize_toggle(old_event, default="ON")
@@ -397,13 +402,13 @@ class MariaDBManager:
                     f"WARNING: Failed to restore event_scheduler={desired}: {err or 'unknown error'}"
                 )
 
-        old_super = previous_state.get("super_read_only")
-        if old_super is not None:
-            desired = self._normalize_toggle(old_super, default="OFF")
-            ok, err = self._set_global_variable("super_read_only", desired)
+        old_offline = previous_state.get("offline_mode")
+        if old_offline is not None:
+            desired = self._normalize_toggle(old_offline, default="OFF")
+            ok, err = self._set_global_variable("offline_mode", desired)
             if not ok:
                 print(
-                    f"WARNING: Failed to restore super_read_only={desired}: {err or 'unknown error'}"
+                    f"WARNING: Failed to restore offline_mode={desired}: {err or 'unknown error'}"
                 )
 
         old_read = previous_state.get("read_only")
@@ -1417,6 +1422,41 @@ class MariaDBManager:
 
         return all_backups
 
+    def _drop_non_system_databases(self):
+        """Drop all non-system schemas before restore (destructive)."""
+        query = (
+            "SELECT schema_name FROM information_schema.schemata "
+            "WHERE schema_name NOT IN ('mysql','information_schema','performance_schema','sys');"
+        )
+        code, stdout, stderr = self._run_mysql_sql(query)
+        if code != 0:
+            print(
+                f"ERROR: Could not list databases for drop operation: {stderr or 'unknown error'}"
+            )
+            return False
+
+        schemas = [line.strip() for line in stdout.splitlines() if line.strip()]
+        if not schemas:
+            print("No non-system databases found to drop.")
+            return True
+
+        print("Databases to drop (non-system):")
+        for schema in schemas:
+            print(f"  - {schema}")
+
+        for schema in schemas:
+            escaped = schema.replace("`", "``")
+            drop_sql = f"DROP DATABASE IF EXISTS `{escaped}`;"
+            dcode, _, dstderr = self._run_mysql_sql(drop_sql)
+            if dcode != 0:
+                print(
+                    f"ERROR: Failed to drop database '{schema}': {dstderr or 'unknown error'}"
+                )
+                return False
+
+        print(f"✓ Dropped {len(schemas)} non-system database(s)")
+        return True
+
     def restore_backup(
         self,
         backup_path,
@@ -1427,6 +1467,7 @@ class MariaDBManager:
         master_port=None,
         restore_mode="full",
         protected_restore=True,
+        drop_non_system_databases=False,
     ):
         """
         Restore a backup
@@ -1440,6 +1481,7 @@ class MariaDBManager:
             master_port: Master server port (for slave setup, defaults to config)
             restore_mode: What to restore: full, users-grants, databases, schema, data
             protected_restore: Enable restore safety mode (read_only ON, event_scheduler OFF)
+            drop_non_system_databases: Drop non-system schemas before restore (destructive)
         """
         print(f"\n{'='*60}")
         print(f"Restoring Backup")
@@ -1502,6 +1544,9 @@ class MariaDBManager:
             f"   Target: {self.config['mysql']['host']}:{self.config['mysql']['port']}"
         )
         print(f"   Protected restore: {'ENABLED' if protected_restore else 'DISABLED'}")
+        print(
+            f"   Drop non-system DBs first: {'YES' if drop_non_system_databases else 'NO'}"
+        )
 
         if restore_as_slave:
             print(f"   Mode: SLAVE (replication will be configured)")
@@ -1565,6 +1610,16 @@ class MariaDBManager:
             print("✓ Protected restore mode enabled")
         else:
             print("\nWARNING: Protected restore mode disabled by user")
+
+        if drop_non_system_databases:
+            if not restore_databases:
+                print(
+                    "WARNING: Drop non-system DBs requested but restore mode does not include database restore"
+                )
+            else:
+                print("\nRunning destructive pre-restore cleanup: dropping non-system databases...")
+                if not self._drop_non_system_databases():
+                    return False
 
         try:
             # Locate users/grants restore source first so definers exist before routines are created.
@@ -2249,11 +2304,14 @@ class MariaDBManager:
 
                                 protected_choice = input("Use protected restore mode? (yes/no) [yes]: ").strip().lower()
                                 protected_restore = protected_choice in {"", "y", "yes"}
+                                drop_choice = input("Drop non-system databases before restore? (yes/no) [no]: ").strip().lower()
+                                drop_non_system = drop_choice in {"y", "yes"}
 
                                 self.restore_backup(
                                     backups[idx]["path"],
                                     restore_mode=restore_mode,
                                     protected_restore=protected_restore,
+                                    drop_non_system_databases=drop_non_system,
                                 )
                             else:
                                 print("Invalid backup number")
@@ -2301,6 +2359,8 @@ class MariaDBManager:
 
                                 protected_choice = input("Use protected restore mode? (yes/no) [yes]: ").strip().lower()
                                 protected_restore = protected_choice in {"", "y", "yes"}
+                                drop_choice = input("Drop non-system databases before restore? (yes/no) [no]: ").strip().lower()
+                                drop_non_system = drop_choice in {"y", "yes"}
 
                                 # Check if config has replication settings
                                 has_config = self.config.has_section('replication')
@@ -2345,6 +2405,7 @@ class MariaDBManager:
                                     master_port=master_port,
                                     restore_mode=restore_mode,
                                     protected_restore=protected_restore,
+                                    drop_non_system_databases=drop_non_system,
                                 )
                             else:
                                 print("Invalid backup number")
@@ -2398,6 +2459,9 @@ Examples:
 
     # Restore without protection mode (not recommended)
     %(prog)s --restore /path/to/backup --unprotected-restore
+
+    # Destructive restore prep: drop non-system databases first
+    %(prog)s --restore /path/to/backup --drop-non-system-databases
 
     # Restore users and grants only
     %(prog)s --restore /path/to/backup --restore-mode users-grants
@@ -2455,6 +2519,11 @@ Examples:
         help="Disable protected restore mode (default keeps server read-only and event scheduler off during restore)",
     )
     parser.add_argument(
+        "--drop-non-system-databases",
+        action="store_true",
+        help="Drop all non-system databases before restore (destructive)",
+    )
+    parser.add_argument(
         "--slave", "-s", action="store_true", help="Configure as slave (with --restore)"
     )
     parser.add_argument("--master-host", help="Master host for slave setup")
@@ -2486,6 +2555,7 @@ Examples:
             master_port=args.master_port if hasattr(args, 'master_port') else None,
             restore_mode=args.restore_mode,
             protected_restore=not args.unprotected_restore,
+            drop_non_system_databases=args.drop_non_system_databases,
         )
         sys.exit(0 if success else 1)
 

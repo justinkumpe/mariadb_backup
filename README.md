@@ -53,6 +53,30 @@ A comprehensive Python-based solution for managing MariaDB backups with support 
    chmod 600 mariadb_backup.conf
    ```
 
+### Provision A New Restore Server
+
+Use the provisioning script to install MariaDB, create a restore admin user, and generate a config file ready for `mariadb_manager.py`:
+
+```bash
+chmod +x provision_restore_server.sh
+
+# Interactive password prompt
+sudo ./provision_restore_server.sh
+
+# Non-interactive example
+sudo ./provision_restore_server.sh \
+   --db-admin-user restore_admin \
+   --db-admin-pass 'StrongPass123!' \
+   --config-path /etc/mariadb_backup.conf \
+   --backup-root /var/backups/mariadb \
+   --force
+```
+
+Notes:
+- Script is intended for Debian/Ubuntu/RHEL-family Linux servers.
+- It enables and starts MariaDB service automatically.
+- The created DB user is granted full privileges so protected restore operations can run.
+
 ## Usage
 
 ### Interactive Menu Mode
@@ -113,10 +137,18 @@ By default, restore runs in **protected mode**:
 - Sets global `event_scheduler=OFF` during restore
 - Restores previous settings automatically when restore exits
 
+Note: privileged users may still be able to write during restore on some MariaDB setups.
+
 To disable this (not recommended):
 
 ```bash
 ./mariadb_manager.py --restore /var/backups/mariadb/daily/backup_20260122 --unprotected-restore
+```
+
+To run a destructive pre-clean (drop all non-system databases before restore):
+
+```bash
+./mariadb_manager.py --restore /var/backups/mariadb/daily/backup_20260122 --drop-non-system-databases
 ```
 
 **Restore Mode Selection (targeted restore):**
