@@ -21,6 +21,8 @@ import urllib.request
 
 
 class MariaDBManager:
+    SYSTEM_SCHEMAS = {"mysql", "information_schema", "performance_schema", "sys"}
+
     def __init__(self, config_file=None):
         # If no config specified, search for existing configs
         if config_file is None:
@@ -366,6 +368,93 @@ class MariaDBManager:
                 gunzip.wait()
 
         return temp_path, skipped_lines
+
+    def _create_restore_file_without_system_schemas(self, db_file, is_compressed):
+        """Create temporary SQL file with MariaDB system schemas removed."""
+        temp_sql = tempfile.NamedTemporaryFile(mode="w", suffix=".sql", delete=False)
+        temp_path = temp_sql.name
+        temp_sql.close()
+
+        skipped_dbs = set()
+        skip_current_db = False
+
+        if is_compressed:
+            gunzip = subprocess.Popen(
+                ["gunzip", "-c", db_file],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            source = gunzip.stdout
+        else:
+            gunzip = None
+            source = open(db_file, "r")
+
+        try:
+            with open(temp_path, "w") as out:
+                for line in source:
+                    # mysqldump prints this before each schema when using --all-databases.
+                    if line.startswith("-- Current Database: `"):
+                        db_name = line.split("`", 2)[1]
+                        skip_current_db = db_name in self.SYSTEM_SCHEMAS
+                        if skip_current_db:
+                            skipped_dbs.add(db_name)
+                            continue
+
+                    if line.startswith("CREATE DATABASE") or line.startswith("DROP DATABASE"):
+                        if any(f"`{db}`" in line for db in self.SYSTEM_SCHEMAS):
+                            continue
+
+                    if line.startswith("USE `"):
+                        db_name = line.split("`", 2)[1]
+                        skip_current_db = db_name in self.SYSTEM_SCHEMAS
+                        if skip_current_db:
+                            skipped_dbs.add(db_name)
+                            continue
+
+                    if skip_current_db:
+                        continue
+
+                    out.write(line)
+        finally:
+            if source:
+                source.close()
+            if gunzip:
+                gunzip.wait()
+
+        return temp_path, sorted(skipped_dbs)
+
+    def _restore_users_and_grants(self, users_restore_file, is_users_compressed):
+        """Restore users/grants file and return True/False based on mysql exit code."""
+        if is_users_compressed:
+            gunzip = subprocess.Popen(
+                ["gunzip", "-c", users_restore_file], stdout=subprocess.PIPE
+            )
+            mysql = subprocess.Popen(
+                ["mysql", "--force"] + self.get_mysql_connection_args(),
+                stdin=gunzip.stdout,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            gunzip.stdout.close()
+            _, stderr = mysql.communicate()
+        else:
+            with open(users_restore_file, "r") as f:
+                mysql = subprocess.Popen(
+                    ["mysql", "--force"] + self.get_mysql_connection_args(),
+                    stdin=f,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                _, stderr = mysql.communicate()
+
+        if mysql.returncode != 0:
+            print(
+                f"WARNING: Users/grants restore returned non-zero status: {self._format_restore_error(stderr)}"
+            )
+            return False
+
+        return True
 
     def test_connection(self):
         """Test MySQL connection"""
@@ -1095,86 +1184,7 @@ class MariaDBManager:
                         "WARNING: Could not raise global max_allowed_packet automatically (insufficient privileges or server restriction)."
                     )
 
-        # 1. Restore databases
-        print("\n[1/3] Restoring databases...")
-        filtered_temp = None
-        try:
-            if is_compressed:
-                # Decompress and pipe to mysql
-                gunzip = subprocess.Popen(
-                    ["gunzip", "-c", db_file], stdout=subprocess.PIPE
-                )
-                mysql = subprocess.Popen(
-                    ["mysql"] + self.get_mysql_connection_args(),
-                    stdin=gunzip.stdout,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                )
-                gunzip.stdout.close()
-                _, stderr = mysql.communicate()
-
-                if mysql.returncode != 0:
-                    lowered = (stderr or "").lower()
-                    if "server has gone away" in lowered and "bw_jobs_cache" in lowered:
-                        print(
-                            "WARNING: Restore failed on oversized bw_jobs_cache row; retrying while skipping bw_jobs_cache INSERTs..."
-                        )
-                        filtered_temp, skipped = self._create_filtered_restore_file(
-                            db_file, is_compressed, "bw_jobs_cache"
-                        )
-                        code, retry_stderr = self._run_restore_from_file(filtered_temp)
-                        if code != 0:
-                            print(
-                                f"ERROR: Database restore failed after fallback retry: {self._format_restore_error(retry_stderr)}"
-                            )
-                            return False
-                        print(
-                            f"✓ Databases restored with fallback (skipped {skipped} bw_jobs_cache INSERT statement(s))"
-                        )
-                    else:
-                        print(f"ERROR: Database restore failed: {self._format_restore_error(stderr)}")
-                        return False
-            else:
-                # Direct restore
-                code, stderr = self._run_restore_from_file(db_file)
-
-                if code != 0:
-                    lowered = (stderr or "").lower()
-                    if "server has gone away" in lowered and "bw_jobs_cache" in lowered:
-                        print(
-                            "WARNING: Restore failed on oversized bw_jobs_cache row; retrying while skipping bw_jobs_cache INSERTs..."
-                        )
-                        filtered_temp, skipped = self._create_filtered_restore_file(
-                            db_file, is_compressed, "bw_jobs_cache"
-                        )
-                        code, retry_stderr = self._run_restore_from_file(filtered_temp)
-                        if code != 0:
-                            print(
-                                f"ERROR: Database restore failed after fallback retry: {self._format_restore_error(retry_stderr)}"
-                            )
-                            return False
-                        print(
-                            f"✓ Databases restored with fallback (skipped {skipped} bw_jobs_cache INSERT statement(s))"
-                        )
-                    else:
-                        print(f"ERROR: Database restore failed: {self._format_restore_error(stderr)}")
-                        return False
-
-            if not filtered_temp:
-                print("✓ Databases restored successfully")
-        except Exception as e:
-            print(f"ERROR: Database restore failed: {e}")
-            return False
-        finally:
-            if filtered_temp and os.path.exists(filtered_temp):
-                try:
-                    os.remove(filtered_temp)
-                except OSError:
-                    pass
-
-        # 2. Restore users (optional)
-        print("\n[2/3] Restoring users and grants...")
-
+        # Locate users/grants restore source first so definers exist before routines are created.
         if os.path.exists(users_gz):
             users_restore_file = users_gz
             is_users_compressed = True
@@ -1185,31 +1195,78 @@ class MariaDBManager:
             print("WARNING: Users backup file not found, skipping")
             users_restore_file = None
 
+        # 1. Restore users/grants first to satisfy DEFINER accounts for routines/functions.
+        print("\n[1/4] Restoring users and grants (pre-pass)...")
         if users_restore_file:
             try:
-                if is_users_compressed:
-                    gunzip = subprocess.Popen(
-                        ["gunzip", "-c", users_restore_file], stdout=subprocess.PIPE
-                    )
-                    mysql = subprocess.Popen(
-                        ["mysql"] + self.get_mysql_connection_args(),
-                        stdin=gunzip.stdout,
-                        stderr=subprocess.PIPE,
-                        text=True,
-                    )
-                    gunzip.stdout.close()
-                    _, stderr = mysql.communicate()
+                if self._restore_users_and_grants(users_restore_file, is_users_compressed):
+                    print("✓ Users and grants pre-pass restored")
                 else:
-                    with open(users_restore_file, "r") as f:
-                        mysql = subprocess.Popen(
-                            ["mysql"] + self.get_mysql_connection_args(),
-                            stdin=f,
-                            stderr=subprocess.PIPE,
-                            text=True,
-                        )
-                        _, stderr = mysql.communicate()
+                    print("WARNING: Users/grants pre-pass had SQL errors (continuing)")
+            except Exception as e:
+                print(f"WARNING: Users restore pre-pass had errors: {e}")
 
-                print("✓ Users and grants restored")
+        # 2. Restore databases
+        print("\n[2/4] Restoring databases...")
+        filtered_temp = None
+        sanitized_temp = None
+        try:
+            print("  → Preparing restore stream (excluding system schemas: mysql, information_schema, performance_schema, sys)...")
+            sanitized_temp, skipped_system_dbs = self._create_restore_file_without_system_schemas(
+                db_file, is_compressed
+            )
+            if skipped_system_dbs:
+                print(f"  → Skipping system schemas from dump: {', '.join(skipped_system_dbs)}")
+
+            code, stderr = self._run_restore_from_file(sanitized_temp)
+
+            if code != 0:
+                lowered = (stderr or "").lower()
+                if "server has gone away" in lowered and "bw_jobs_cache" in lowered:
+                    print(
+                        "WARNING: Restore failed on oversized bw_jobs_cache row; retrying while skipping bw_jobs_cache INSERTs..."
+                    )
+                    filtered_temp, skipped = self._create_filtered_restore_file(
+                        sanitized_temp, False, "bw_jobs_cache"
+                    )
+                    code, retry_stderr = self._run_restore_from_file(filtered_temp)
+                    if code != 0:
+                        print(
+                            f"ERROR: Database restore failed after fallback retry: {self._format_restore_error(retry_stderr)}"
+                        )
+                        return False
+                    print(
+                        f"✓ Databases restored with fallback (skipped {skipped} bw_jobs_cache INSERT statement(s))"
+                    )
+                else:
+                    print(f"ERROR: Database restore failed: {self._format_restore_error(stderr)}")
+                    return False
+
+            if not filtered_temp:
+                print("✓ Databases restored successfully")
+        except Exception as e:
+            print(f"ERROR: Database restore failed: {e}")
+            return False
+        finally:
+            if sanitized_temp and os.path.exists(sanitized_temp):
+                try:
+                    os.remove(sanitized_temp)
+                except OSError:
+                    pass
+            if filtered_temp and os.path.exists(filtered_temp):
+                try:
+                    os.remove(filtered_temp)
+                except OSError:
+                    pass
+
+        # 3. Restore users/grants again so permissions are fully applied after schema/data import.
+        print("\n[3/4] Restoring users and grants (post-pass)...")
+        if users_restore_file:
+            try:
+                if self._restore_users_and_grants(users_restore_file, is_users_compressed):
+                    print("✓ Users and grants post-pass restored")
+                else:
+                    print("WARNING: Users/grants post-pass had SQL errors")
             except Exception as e:
                 print(f"WARNING: Users restore had errors: {e}")
 
@@ -1219,7 +1276,7 @@ class MariaDBManager:
             and replication_info
             and replication_info.get("master_status")
         ):
-            print("\n[3/3] Configuring slave replication...")
+            print("\n[4/4] Configuring slave replication...")
 
             master_status = replication_info["master_status"]
 
@@ -1298,7 +1355,7 @@ class MariaDBManager:
                 print(f"ERROR: Slave configuration failed: {e}")
                 return False
         else:
-            print("\n[3/3] Skipping replication configuration")
+            print("\n[4/4] Skipping replication configuration")
 
         print(f"\n{'='*60}")
         print("Restore completed successfully!")
