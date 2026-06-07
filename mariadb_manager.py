@@ -703,18 +703,19 @@ class MariaDBManager:
                 total_bytes += len(line.encode("utf-8", errors="ignore"))
 
                 now = time.time()
-                if now - last_report >= 10:
+                if now - last_report >= 2:
                     mb = total_bytes / (1024 * 1024)
                     elapsed = int(now - started)
+                    spinner = self._spinner_frame(now - started)
                     if estimated_total_bytes and estimated_total_bytes > 0:
                         percent = min((total_bytes / estimated_total_bytes) * 100, 100.0)
                         eta = self._format_eta(total_bytes, estimated_total_bytes, elapsed)
-                        print(
-                            f"  → {self._progress_bar(percent)} {percent:5.1f}% | {mb:.1f}/{estimated_total_bytes / (1024 * 1024):.1f} MB | {processed_lines:,} lines | elapsed {elapsed}s | eta {eta}"
+                        self._update_dynamic_progress_line(
+                            f"  → {spinner} {self._progress_bar(percent)} {percent:5.1f}% | {mb:.1f}/{estimated_total_bytes / (1024 * 1024):.1f} MB | {processed_lines:,} lines | elapsed {elapsed}s | eta {eta}"
                         )
                     else:
-                        print(
-                            f"  → Restore stream progress: {processed_lines:,} lines sent ({mb:.1f} MB) in {elapsed}s"
+                        self._update_dynamic_progress_line(
+                            f"  → {spinner} {self._progress_bar(0)}  --.-% | {mb:.1f} MB streamed | {processed_lines:,} lines | elapsed {elapsed}s"
                         )
                     last_report = now
 
@@ -725,9 +726,17 @@ class MariaDBManager:
                 elapsed = int(time.time() - started)
                 final_mb = total_bytes / (1024 * 1024)
                 total_mb = estimated_total_bytes / (1024 * 1024)
-                print(
-                    f"  → {self._progress_bar(100)} 100.0% | {final_mb:.1f}/{total_mb:.1f} MB | {processed_lines:,} lines | elapsed {elapsed}s"
+                self._update_dynamic_progress_line(
+                    f"  → {self._spinner_frame(time.time() - started)} {self._progress_bar(100)} 100.0% | {final_mb:.1f}/{total_mb:.1f} MB | {processed_lines:,} lines | elapsed {elapsed}s"
                 )
+            else:
+                elapsed = int(time.time() - started)
+                final_mb = total_bytes / (1024 * 1024)
+                self._update_dynamic_progress_line(
+                    f"  → {self._spinner_frame(time.time() - started)} {self._progress_bar(100)} done | {final_mb:.1f} MB streamed | {processed_lines:,} lines | elapsed {elapsed}s"
+                )
+
+            self._finish_dynamic_progress_line()
             return (
                 mysql.returncode,
                 stderr,
@@ -737,6 +746,7 @@ class MariaDBManager:
                 total_bytes,
             )
         finally:
+            self._finish_dynamic_progress_line()
             try:
                 if source:
                     source.close()
@@ -790,6 +800,29 @@ class MariaDBManager:
         pct = max(0.0, min(percent, 100.0))
         filled = int(round((pct / 100.0) * width))
         return "[" + ("#" * filled) + ("-" * (width - filled)) + "]"
+
+    def _spinner_frame(self, elapsed_seconds):
+        """Return a simple activity spinner frame."""
+        frames = ["|", "/", "-", "\\"]
+        idx = int(elapsed_seconds * 4) % len(frames)
+        return frames[idx]
+
+    def _update_dynamic_progress_line(self, text):
+        """Update a single in-place progress line in terminal output."""
+        if not hasattr(self, "_progress_line_len"):
+            self._progress_line_len = 0
+
+        padding = max(self._progress_line_len - len(text), 0)
+        sys.stdout.write("\r" + text + (" " * padding))
+        sys.stdout.flush()
+        self._progress_line_len = len(text)
+
+    def _finish_dynamic_progress_line(self):
+        """Finalize an in-place progress line with a newline."""
+        if hasattr(self, "_progress_line_len") and self._progress_line_len > 0:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            self._progress_line_len = 0
 
     def _format_eta(self, processed_bytes, total_bytes, elapsed_seconds):
         """Estimate ETA from current throughput."""
@@ -1474,19 +1507,30 @@ class MariaDBManager:
             print("No non-system databases found to drop.")
             return True
 
-        print("Databases to drop (non-system):")
-        for schema in schemas:
-            print(f"  - {schema}")
+        total = len(schemas)
+        started = time.time()
+        print(f"Dropping {total} non-system database(s)...")
+        self._update_dynamic_progress_line(
+            f"  → {self._spinner_frame(0)} {self._progress_bar(0)}   0.0% | 0/{total} databases dropped"
+        )
 
-        for schema in schemas:
+        for idx, schema in enumerate(schemas, 1):
             escaped = schema.replace("`", "``")
             drop_sql = f"DROP DATABASE IF EXISTS `{escaped}`;"
             dcode, _, dstderr = self._run_mysql_sql(drop_sql)
             if dcode != 0:
+                self._finish_dynamic_progress_line()
                 print(
                     f"ERROR: Failed to drop database '{schema}': {dstderr or 'unknown error'}"
                 )
                 return False
+
+            pct = (idx / total) * 100
+            self._update_dynamic_progress_line(
+                f"  → {self._spinner_frame(time.time() - started)} {self._progress_bar(pct)} {pct:5.1f}% | {idx}/{total} databases dropped"
+            )
+
+        self._finish_dynamic_progress_line()
 
         print(f"✓ Dropped {len(schemas)} non-system database(s)")
         return True
