@@ -576,6 +576,8 @@ class MariaDBManager:
         skip_table=None,
     ):
         """Stream filtered SQL directly into mysql with progress updates."""
+        estimated_total_bytes = self._estimate_restore_source_bytes(db_file, is_compressed)
+
         if is_compressed:
             gunzip = subprocess.Popen(
                 ["gunzip", "-c", db_file],
@@ -659,20 +661,34 @@ class MariaDBManager:
 
                 mysql.stdin.write(line)
                 processed_lines += 1
-                total_bytes += len(line)
+                total_bytes += len(line.encode("utf-8", errors="ignore"))
 
                 now = time.time()
                 if now - last_report >= 10:
                     mb = total_bytes / (1024 * 1024)
                     elapsed = int(now - started)
-                    print(
-                        f"  → Restore stream progress: {processed_lines:,} lines sent ({mb:.1f} MB) in {elapsed}s"
-                    )
+                    if estimated_total_bytes and estimated_total_bytes > 0:
+                        percent = min((total_bytes / estimated_total_bytes) * 100, 100.0)
+                        eta = self._format_eta(total_bytes, estimated_total_bytes, elapsed)
+                        print(
+                            f"  → {self._progress_bar(percent)} {percent:5.1f}% | {mb:.1f}/{estimated_total_bytes / (1024 * 1024):.1f} MB | {processed_lines:,} lines | elapsed {elapsed}s | eta {eta}"
+                        )
+                    else:
+                        print(
+                            f"  → Restore stream progress: {processed_lines:,} lines sent ({mb:.1f} MB) in {elapsed}s"
+                        )
                     last_report = now
 
             mysql.stdin.close()
             stderr = mysql.stderr.read()
             mysql.wait()
+            if estimated_total_bytes and estimated_total_bytes > 0:
+                elapsed = int(time.time() - started)
+                final_mb = total_bytes / (1024 * 1024)
+                total_mb = estimated_total_bytes / (1024 * 1024)
+                print(
+                    f"  → {self._progress_bar(100)} 100.0% | {final_mb:.1f}/{total_mb:.1f} MB | {processed_lines:,} lines | elapsed {elapsed}s"
+                )
             return (
                 mysql.returncode,
                 stderr,
@@ -689,6 +705,69 @@ class MariaDBManager:
                 pass
             if gunzip:
                 gunzip.wait()
+
+    def _estimate_restore_source_bytes(self, db_file, is_compressed):
+        """Estimate total bytes to stream for percent progress display."""
+        if not is_compressed:
+            try:
+                return os.path.getsize(db_file)
+            except OSError:
+                return None
+
+        # Prefer gzip metadata for O(1) estimate.
+        try:
+            result = subprocess.run(
+                ["gzip", "-l", db_file],
+                capture_output=True,
+                text=True,
+                stdin=subprocess.DEVNULL,
+            )
+            if result.returncode == 0:
+                lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+                if len(lines) >= 2:
+                    # Output format: compressed uncompressed ratio uncompressed_name
+                    parts = lines[-1].split()
+                    if len(parts) >= 2 and parts[1].isdigit():
+                        uncompressed = int(parts[1])
+                        if uncompressed > 0:
+                            return uncompressed
+        except Exception:
+            pass
+
+        # Fallback to gzip footer size (may wrap for files >4GB).
+        try:
+            with open(db_file, "rb") as f:
+                f.seek(-4, os.SEEK_END)
+                raw = f.read(4)
+                if len(raw) == 4:
+                    return int.from_bytes(raw, "little") or None
+        except Exception:
+            pass
+
+        return None
+
+    def _progress_bar(self, percent, width=24):
+        """Render a simple ASCII progress bar for restore stream."""
+        pct = max(0.0, min(percent, 100.0))
+        filled = int(round((pct / 100.0) * width))
+        return "[" + ("#" * filled) + ("-" * (width - filled)) + "]"
+
+    def _format_eta(self, processed_bytes, total_bytes, elapsed_seconds):
+        """Estimate ETA from current throughput."""
+        if not total_bytes or processed_bytes <= 0 or elapsed_seconds <= 0:
+            return "--"
+
+        remaining = max(total_bytes - processed_bytes, 0)
+        rate = processed_bytes / elapsed_seconds
+        if rate <= 0:
+            return "--"
+
+        eta_seconds = int(remaining / rate)
+        mins, secs = divmod(eta_seconds, 60)
+        hours, mins = divmod(mins, 60)
+        if hours > 0:
+            return f"{hours}h{mins:02d}m"
+        return f"{mins:02d}m{secs:02d}s"
 
     def _restore_users_and_grants(self, users_restore_file, is_users_compressed):
         """Restore users/grants file and return True/False based on mysql exit code."""
