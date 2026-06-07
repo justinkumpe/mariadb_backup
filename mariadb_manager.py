@@ -16,12 +16,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 
 
 class MariaDBManager:
     SYSTEM_SCHEMAS = {"mysql", "information_schema", "performance_schema", "sys"}
+    RESTORE_MODES = {"full", "users-grants", "databases", "schema", "data"}
 
     def __init__(self, config_file=None):
         # If no config specified, search for existing configs
@@ -321,6 +323,98 @@ class MariaDBManager:
         result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
         return result.returncode == 0
 
+    def _run_mysql_sql(self, sql):
+        """Run a SQL statement and return (returncode, stdout, stderr)."""
+        cmd = ["mysql"] + self.get_mysql_connection_args() + ["-N", "-B", "-e", sql]
+        result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        return result.returncode, (result.stdout or "").strip(), (result.stderr or "").strip()
+
+    def _get_global_variable(self, var_name):
+        """Get global server variable value as string, or None on failure."""
+        code, stdout, _ = self._run_mysql_sql(f"SELECT @@GLOBAL.{var_name};")
+        if code != 0 or not stdout:
+            return None
+        return stdout.splitlines()[0].strip()
+
+    def _set_global_variable(self, var_name, value):
+        """Set global server variable and return (success, error)."""
+        code, _, stderr = self._run_mysql_sql(f"SET GLOBAL {var_name}={value};")
+        return code == 0, stderr
+
+    def _normalize_toggle(self, value, default="OFF"):
+        """Normalize MariaDB boolean-like values to ON/OFF."""
+        if value is None:
+            return default
+
+        normalized = str(value).strip().lower()
+        if normalized in {"1", "on", "true", "yes"}:
+            return "ON"
+        if normalized in {"0", "off", "false", "no"}:
+            return "OFF"
+        return default
+
+    def _enable_protected_restore(self):
+        """Enable restore protections and return previous state snapshot."""
+        state = {
+            "read_only": self._get_global_variable("read_only"),
+            "event_scheduler": self._get_global_variable("event_scheduler"),
+            "super_read_only": self._get_global_variable("super_read_only"),
+        }
+
+        ok, err = self._set_global_variable("read_only", "ON")
+        if not ok:
+            return False, state, f"Failed to set read_only=ON: {err or 'unknown error'}"
+
+        # super_read_only is not available on all MariaDB versions; best effort.
+        if state["super_read_only"] is not None:
+            ok, err = self._set_global_variable("super_read_only", "ON")
+            if not ok:
+                print(
+                    f"WARNING: Could not set super_read_only=ON: {err or 'unknown error'}"
+                )
+
+        # Stop events from mutating data during restore.
+        ok, err = self._set_global_variable("event_scheduler", "OFF")
+        if not ok:
+            print(
+                f"WARNING: Could not set event_scheduler=OFF: {err or 'unknown error'}"
+            )
+
+        return True, state, None
+
+    def _disable_protected_restore(self, previous_state):
+        """Restore global settings captured before protected restore."""
+        if not previous_state:
+            return
+
+        # Restore scheduler first, then read-only protections.
+        old_event = previous_state.get("event_scheduler")
+        if old_event is not None:
+            desired = self._normalize_toggle(old_event, default="ON")
+            ok, err = self._set_global_variable("event_scheduler", desired)
+            if not ok:
+                print(
+                    f"WARNING: Failed to restore event_scheduler={desired}: {err or 'unknown error'}"
+                )
+
+        old_super = previous_state.get("super_read_only")
+        if old_super is not None:
+            desired = self._normalize_toggle(old_super, default="OFF")
+            ok, err = self._set_global_variable("super_read_only", desired)
+            if not ok:
+                print(
+                    f"WARNING: Failed to restore super_read_only={desired}: {err or 'unknown error'}"
+                )
+
+        old_read = previous_state.get("read_only")
+        if old_read is not None:
+            desired = self._normalize_toggle(old_read, default="OFF")
+            ok, err = self._set_global_variable("read_only", desired)
+            if not ok:
+                print(
+                    f"WARNING: Failed to restore read_only={desired}: {err or 'unknown error'}"
+                )
+
     def _run_restore_from_file(self, sql_file):
         """Run mysql restore from an existing SQL file path."""
         with open(sql_file, "r") as f:
@@ -369,8 +463,14 @@ class MariaDBManager:
 
         return temp_path, skipped_lines
 
-    def _create_restore_file_without_system_schemas(self, db_file, is_compressed):
-        """Create temporary SQL file with MariaDB system schemas removed."""
+    def _create_restore_file_without_system_schemas(
+        self, db_file, is_compressed, include_schema=True, include_data=True
+    ):
+        """Create temporary SQL file with MariaDB system schemas removed.
+
+        include_schema controls DDL/object statements (tables, views, routines, events, triggers, sequences).
+        include_data controls INSERT rows.
+        """
         temp_sql = tempfile.NamedTemporaryFile(mode="w", suffix=".sql", delete=False)
         temp_path = temp_sql.name
         temp_sql.close()
@@ -415,7 +515,34 @@ class MariaDBManager:
                     if skip_current_db:
                         continue
 
+                    if not include_data and line.startswith("INSERT INTO "):
+                        continue
+
+                    if not include_schema and (
+                        line.startswith("DROP DATABASE")
+                        or line.startswith("CREATE DATABASE")
+                        or line.startswith("USE `")
+                        or line.startswith("DROP TABLE")
+                        or line.startswith("CREATE TABLE")
+                        or line.startswith("DROP VIEW")
+                        or line.startswith("CREATE ALGORITHM")
+                        or line.startswith("CREATE VIEW")
+                        or line.startswith("DROP TRIGGER")
+                        or line.startswith("CREATE TRIGGER")
+                        or line.startswith("DROP EVENT")
+                        or line.startswith("CREATE EVENT")
+                        or line.startswith("DROP PROCEDURE")
+                        or line.startswith("CREATE PROCEDURE")
+                        or line.startswith("DROP FUNCTION")
+                        or line.startswith("CREATE FUNCTION")
+                        or line.startswith("DROP SEQUENCE")
+                        or line.startswith("CREATE SEQUENCE")
+                        or line.startswith("ALTER TABLE")
+                    ):
+                        continue
+
                     out.write(line)
+
         finally:
             if source:
                 source.close()
@@ -423,6 +550,145 @@ class MariaDBManager:
                 gunzip.wait()
 
         return temp_path, sorted(skipped_dbs)
+
+    def _resolve_restore_mode(self, restore_mode):
+        """Normalize restore mode and derive include flags."""
+        mode = (restore_mode or "full").strip().lower()
+        if mode not in self.RESTORE_MODES:
+            raise ValueError(
+                f"Invalid restore mode '{restore_mode}'. Valid modes: {', '.join(sorted(self.RESTORE_MODES))}"
+            )
+
+        return {
+            "mode": mode,
+            "restore_users": mode in {"full", "users-grants"},
+            "restore_databases": mode in {"full", "databases", "schema", "data"},
+            "include_schema": mode in {"full", "databases", "schema"},
+            "include_data": mode in {"full", "databases", "data"},
+        }
+
+    def _run_filtered_restore_stream(
+        self,
+        db_file,
+        is_compressed,
+        include_schema=True,
+        include_data=True,
+        skip_table=None,
+    ):
+        """Stream filtered SQL directly into mysql with progress updates."""
+        if is_compressed:
+            gunzip = subprocess.Popen(
+                ["gunzip", "-c", db_file],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            source = gunzip.stdout
+        else:
+            gunzip = None
+            source = open(db_file, "r")
+
+        mysql = subprocess.Popen(
+            ["mysql"] + self.get_mysql_connection_args(),
+            stdin=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        skip_prefix = f"INSERT INTO `{skip_table}`" if skip_table else None
+        skipped_table_inserts = 0
+        skipped_dbs = set()
+        skip_current_db = False
+        processed_lines = 0
+        total_bytes = 0
+        started = time.time()
+        last_report = started
+
+        try:
+            for line in source:
+                if line.startswith("-- Current Database: `"):
+                    db_name = line.split("`", 2)[1]
+                    skip_current_db = db_name in self.SYSTEM_SCHEMAS
+                    if skip_current_db:
+                        skipped_dbs.add(db_name)
+                        continue
+
+                if line.startswith("CREATE DATABASE") or line.startswith("DROP DATABASE"):
+                    if any(f"`{db}`" in line for db in self.SYSTEM_SCHEMAS):
+                        continue
+
+                if line.startswith("USE `"):
+                    db_name = line.split("`", 2)[1]
+                    skip_current_db = db_name in self.SYSTEM_SCHEMAS
+                    if skip_current_db:
+                        skipped_dbs.add(db_name)
+                        continue
+
+                if skip_current_db:
+                    continue
+
+                if skip_prefix and line.startswith(skip_prefix):
+                    skipped_table_inserts += 1
+                    continue
+
+                if not include_data and line.startswith("INSERT INTO "):
+                    continue
+
+                if not include_schema and (
+                    line.startswith("DROP DATABASE")
+                    or line.startswith("CREATE DATABASE")
+                    or line.startswith("USE `")
+                    or line.startswith("DROP TABLE")
+                    or line.startswith("CREATE TABLE")
+                    or line.startswith("DROP VIEW")
+                    or line.startswith("CREATE ALGORITHM")
+                    or line.startswith("CREATE VIEW")
+                    or line.startswith("DROP TRIGGER")
+                    or line.startswith("CREATE TRIGGER")
+                    or line.startswith("DROP EVENT")
+                    or line.startswith("CREATE EVENT")
+                    or line.startswith("DROP PROCEDURE")
+                    or line.startswith("CREATE PROCEDURE")
+                    or line.startswith("DROP FUNCTION")
+                    or line.startswith("CREATE FUNCTION")
+                    or line.startswith("DROP SEQUENCE")
+                    or line.startswith("CREATE SEQUENCE")
+                    or line.startswith("ALTER TABLE")
+                ):
+                    continue
+
+                mysql.stdin.write(line)
+                processed_lines += 1
+                total_bytes += len(line)
+
+                now = time.time()
+                if now - last_report >= 10:
+                    mb = total_bytes / (1024 * 1024)
+                    elapsed = int(now - started)
+                    print(
+                        f"  → Restore stream progress: {processed_lines:,} lines sent ({mb:.1f} MB) in {elapsed}s"
+                    )
+                    last_report = now
+
+            mysql.stdin.close()
+            stderr = mysql.stderr.read()
+            mysql.wait()
+            return (
+                mysql.returncode,
+                stderr,
+                sorted(skipped_dbs),
+                skipped_table_inserts,
+                processed_lines,
+                total_bytes,
+            )
+        finally:
+            try:
+                if source:
+                    source.close()
+            except Exception:
+                pass
+            if gunzip:
+                gunzip.wait()
 
     def _restore_users_and_grants(self, users_restore_file, is_users_compressed):
         """Restore users/grants file and return True/False based on mysql exit code."""
@@ -1080,6 +1346,8 @@ class MariaDBManager:
         master_user=None,
         master_password=None,
         master_port=None,
+        restore_mode="full",
+        protected_restore=True,
     ):
         """
         Restore a backup
@@ -1091,6 +1359,8 @@ class MariaDBManager:
             master_user: Master replication user (for slave setup, defaults to config)
             master_password: Master replication password (for slave setup, defaults to config)
             master_port: Master server port (for slave setup, defaults to config)
+            restore_mode: What to restore: full, users-grants, databases, schema, data
+            protected_restore: Enable restore safety mode (read_only ON, event_scheduler OFF)
         """
         print(f"\n{'='*60}")
         print(f"Restoring Backup")
@@ -1101,6 +1371,27 @@ class MariaDBManager:
             return False
 
         print(f"Backup location: {backup_path}")
+
+        try:
+            restore_opts = self._resolve_restore_mode(restore_mode)
+        except ValueError as e:
+            print(f"ERROR: {e}")
+            return False
+
+        selected_mode = restore_opts["mode"]
+        restore_users = restore_opts["restore_users"]
+        restore_databases = restore_opts["restore_databases"]
+        include_schema = restore_opts["include_schema"]
+        include_data = restore_opts["include_data"]
+
+        mode_descriptions = {
+            "full": "Databases + users/grants",
+            "users-grants": "Users and grants only",
+            "databases": "Databases only (schema + data + routines/functions/events/triggers/sequences)",
+            "schema": "Database schema/objects only (tables/views/routines/functions/events/triggers/sequences)",
+            "data": "Database data only (INSERT rows)",
+        }
+        print(f"Restore mode: {selected_mode} - {mode_descriptions[selected_mode]}")
 
         # Check for required files
         db_backup_file = os.path.join(backup_path, "all_databases.sql")
@@ -1131,6 +1422,7 @@ class MariaDBManager:
         print(
             f"   Target: {self.config['mysql']['host']}:{self.config['mysql']['port']}"
         )
+        print(f"   Protected restore: {'ENABLED' if protected_restore else 'DISABLED'}")
 
         if restore_as_slave:
             print(f"   Mode: SLAVE (replication will be configured)")
@@ -1184,183 +1476,217 @@ class MariaDBManager:
                         "WARNING: Could not raise global max_allowed_packet automatically (insufficient privileges or server restriction)."
                     )
 
-        # Locate users/grants restore source first so definers exist before routines are created.
-        if os.path.exists(users_gz):
-            users_restore_file = users_gz
-            is_users_compressed = True
-        elif os.path.exists(users_file):
-            users_restore_file = users_file
-            is_users_compressed = False
+        protected_state = None
+        if protected_restore:
+            print("\nEnabling protected restore mode (read_only=ON, event_scheduler=OFF)...")
+            ok, protected_state, error = self._enable_protected_restore()
+            if not ok:
+                print(f"ERROR: {error}")
+                return False
+            print("✓ Protected restore mode enabled")
         else:
-            print("WARNING: Users backup file not found, skipping")
-            users_restore_file = None
+            print("\nWARNING: Protected restore mode disabled by user")
 
-        # 1. Restore users/grants first to satisfy DEFINER accounts for routines/functions.
-        print("\n[1/4] Restoring users and grants (pre-pass)...")
-        if users_restore_file:
-            try:
-                if self._restore_users_and_grants(users_restore_file, is_users_compressed):
-                    print("✓ Users and grants pre-pass restored")
-                else:
-                    print("WARNING: Users/grants pre-pass had SQL errors (continuing)")
-            except Exception as e:
-                print(f"WARNING: Users restore pre-pass had errors: {e}")
-
-        # 2. Restore databases
-        print("\n[2/4] Restoring databases...")
-        filtered_temp = None
-        sanitized_temp = None
         try:
-            print("  → Preparing restore stream (excluding system schemas: mysql, information_schema, performance_schema, sys)...")
-            sanitized_temp, skipped_system_dbs = self._create_restore_file_without_system_schemas(
-                db_file, is_compressed
+            # Locate users/grants restore source first so definers exist before routines are created.
+            if os.path.exists(users_gz):
+                users_restore_file = users_gz
+                is_users_compressed = True
+            elif os.path.exists(users_file):
+                users_restore_file = users_file
+                is_users_compressed = False
+            else:
+                print("WARNING: Users backup file not found, skipping")
+                users_restore_file = None
+
+            total_steps = 0
+            if restore_users and users_restore_file:
+                total_steps += 1
+            if restore_databases:
+                total_steps += 1
+            if restore_users and users_restore_file and restore_databases:
+                total_steps += 1
+            will_configure_slave = (
+                restore_as_slave and replication_info and replication_info.get("master_status")
             )
-            if skipped_system_dbs:
-                print(f"  → Skipping system schemas from dump: {', '.join(skipped_system_dbs)}")
+            if will_configure_slave:
+                total_steps += 1
 
-            code, stderr = self._run_restore_from_file(sanitized_temp)
+            step = 1
 
-            if code != 0:
-                lowered = (stderr or "").lower()
-                if "server has gone away" in lowered and "bw_jobs_cache" in lowered:
+            # 1. Restore users/grants first to satisfy DEFINER accounts for routines/functions.
+            if restore_users and users_restore_file:
+                print(f"\n[{step}/{total_steps}] Restoring users and grants (pre-pass)...")
+                try:
+                    if self._restore_users_and_grants(users_restore_file, is_users_compressed):
+                        print("✓ Users and grants pre-pass restored")
+                    else:
+                        print("WARNING: Users/grants pre-pass had SQL errors (continuing)")
+                except Exception as e:
+                    print(f"WARNING: Users restore pre-pass had errors: {e}")
+                step += 1
+            elif restore_users and not users_restore_file:
+                print("WARNING: Restore mode requires users/grants but users backup file is missing")
+
+            # 2. Restore databases
+            if restore_databases:
+                print(f"\n[{step}/{total_steps}] Restoring databases...")
+                try:
+                    print("  → Preparing restore stream (excluding system schemas: mysql, information_schema, performance_schema, sys)...")
+                    print(f"  → Component filter: include_schema={include_schema}, include_data={include_data}")
+                    code, stderr, skipped_system_dbs, skipped_bw_inserts, sent_lines, sent_bytes = self._run_filtered_restore_stream(
+                        db_file,
+                        is_compressed,
+                        include_schema=include_schema,
+                        include_data=include_data,
+                    )
+                    if skipped_system_dbs:
+                        print(f"  → Skipping system schemas from dump: {', '.join(skipped_system_dbs)}")
                     print(
-                        "WARNING: Restore failed on oversized bw_jobs_cache row; retrying while skipping bw_jobs_cache INSERTs..."
+                        f"  → Streamed {sent_lines:,} SQL lines ({sent_bytes / (1024 * 1024):.1f} MB) to mysql"
                     )
-                    filtered_temp, skipped = self._create_filtered_restore_file(
-                        sanitized_temp, False, "bw_jobs_cache"
-                    )
-                    code, retry_stderr = self._run_restore_from_file(filtered_temp)
+
                     if code != 0:
-                        print(
-                            f"ERROR: Database restore failed after fallback retry: {self._format_restore_error(retry_stderr)}"
-                        )
-                        return False
-                    print(
-                        f"✓ Databases restored with fallback (skipped {skipped} bw_jobs_cache INSERT statement(s))"
+                        lowered = (stderr or "").lower()
+                        if "server has gone away" in lowered and "bw_jobs_cache" in lowered:
+                            print(
+                                "WARNING: Restore failed on oversized bw_jobs_cache row; retrying while skipping bw_jobs_cache INSERTs..."
+                            )
+                            code, retry_stderr, skipped_system_dbs, skipped, sent_lines, sent_bytes = self._run_filtered_restore_stream(
+                                db_file,
+                                is_compressed,
+                                include_schema=include_schema,
+                                include_data=include_data,
+                                skip_table="bw_jobs_cache",
+                            )
+                            if code != 0:
+                                print(
+                                    f"ERROR: Database restore failed after fallback retry: {self._format_restore_error(retry_stderr)}"
+                                )
+                                return False
+                            print(
+                                f"✓ Databases restored with fallback (skipped {skipped} bw_jobs_cache INSERT statement(s))"
+                            )
+                        else:
+                            print(f"ERROR: Database restore failed: {self._format_restore_error(stderr)}")
+                            return False
+
+                    if code == 0:
+                        print("✓ Databases restored successfully")
+                except Exception as e:
+                    print(f"ERROR: Database restore failed: {e}")
+                    return False
+                step += 1
+
+            # 3. Restore users/grants again so permissions are fully applied after schema/data import.
+            if restore_users and users_restore_file and restore_databases:
+                print(f"\n[{step}/{total_steps}] Restoring users and grants (post-pass)...")
+                try:
+                    if self._restore_users_and_grants(users_restore_file, is_users_compressed):
+                        print("✓ Users and grants post-pass restored")
+                    else:
+                        print("WARNING: Users/grants post-pass had SQL errors")
+                except Exception as e:
+                    print(f"WARNING: Users restore had errors: {e}")
+                step += 1
+
+            # 4. Configure replication if requested
+            if (
+                restore_as_slave
+                and replication_info
+                and replication_info.get("master_status")
+            ):
+                print(f"\n[{step}/{total_steps}] Configuring slave replication...")
+
+                master_status = replication_info["master_status"]
+
+                if not master_user or not master_password:
+                    print("ERROR: Master user and password required for slave setup")
+                    return False
+
+                try:
+                    # Stop slave if running and reset any existing configuration
+                    print("  → Stopping any existing slave processes...")
+                    cmd = (
+                        ["mysql"] + self.get_mysql_connection_args() + ["-e", "STOP SLAVE;"]
                     )
-                else:
-                    print(f"ERROR: Database restore failed: {self._format_restore_error(stderr)}")
-                    return False
+                    subprocess.run(cmd, capture_output=True, stdin=subprocess.DEVNULL)
 
-            if not filtered_temp:
-                print("✓ Databases restored successfully")
-        except Exception as e:
-            print(f"ERROR: Database restore failed: {e}")
-            return False
+                    print("  → Resetting slave configuration...")
+                    cmd = (
+                        ["mysql"] + self.get_mysql_connection_args() + ["-e", "RESET SLAVE ALL;"]
+                    )
+                    subprocess.run(cmd, capture_output=True, stdin=subprocess.DEVNULL)
+
+                    # Configure slave
+                    print("  → Configuring master connection...")
+                    change_master_sql = f"""
+                    CHANGE MASTER TO
+                        MASTER_HOST='{master_host}',
+                        MASTER_USER='{master_user}',
+                        MASTER_PASSWORD='{master_password}',
+                        MASTER_PORT={master_port},
+                        MASTER_LOG_FILE='{master_status['binlog_file']}',
+                        MASTER_LOG_POS={master_status['binlog_position']};
+                    """
+
+                    cmd = (
+                        ["mysql"]
+                        + self.get_mysql_connection_args()
+                        + ["-e", change_master_sql]
+                    )
+                    result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+
+                    if result.returncode != 0:
+                        print(f"ERROR: Failed to configure slave: {result.stderr}")
+                        print("\nTroubleshooting tips:")
+                        print("  1. Check MariaDB error log: journalctl -u mariadb -n 50")
+                        print("  2. Verify master server is accessible")
+                        print("  3. Verify master user has REPLICATION SLAVE privilege")
+                        return False
+
+                    # Start slave
+                    print("  → Starting slave replication...")
+                    cmd = (
+                        ["mysql"]
+                        + self.get_mysql_connection_args()
+                        + ["-e", "START SLAVE;"]
+                    )
+                    result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+
+                    if result.returncode != 0:
+                        print(f"ERROR: Failed to start slave: {result.stderr}")
+                        return False
+
+                    # Check slave status
+                    print("  → Checking slave status...")
+                    cmd = (
+                        ["mysql"]
+                        + self.get_mysql_connection_args()
+                        + ["-e", "SHOW SLAVE STATUS\\G"]
+                    )
+                    result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+
+                    print("✓ Slave replication configured")
+                    print("\nSlave Status:")
+                    print(result.stdout)
+
+                except Exception as e:
+                    print(f"ERROR: Slave configuration failed: {e}")
+                    return False
+            else:
+                if restore_as_slave:
+                    print("\nSkipping replication configuration (replication metadata not found in backup)")
+
+            print(f"\n{'='*60}")
+            print("Restore completed successfully!")
+            print(f"{'='*60}\n")
+            return True
         finally:
-            if sanitized_temp and os.path.exists(sanitized_temp):
-                try:
-                    os.remove(sanitized_temp)
-                except OSError:
-                    pass
-            if filtered_temp and os.path.exists(filtered_temp):
-                try:
-                    os.remove(filtered_temp)
-                except OSError:
-                    pass
-
-        # 3. Restore users/grants again so permissions are fully applied after schema/data import.
-        print("\n[3/4] Restoring users and grants (post-pass)...")
-        if users_restore_file:
-            try:
-                if self._restore_users_and_grants(users_restore_file, is_users_compressed):
-                    print("✓ Users and grants post-pass restored")
-                else:
-                    print("WARNING: Users/grants post-pass had SQL errors")
-            except Exception as e:
-                print(f"WARNING: Users restore had errors: {e}")
-
-        # 3. Configure replication if requested
-        if (
-            restore_as_slave
-            and replication_info
-            and replication_info.get("master_status")
-        ):
-            print("\n[4/4] Configuring slave replication...")
-
-            master_status = replication_info["master_status"]
-
-            if not master_user or not master_password:
-                print("ERROR: Master user and password required for slave setup")
-                return False
-
-            try:
-                # Stop slave if running and reset any existing configuration
-                print("  → Stopping any existing slave processes...")
-                cmd = (
-                    ["mysql"] + self.get_mysql_connection_args() + ["-e", "STOP SLAVE;"]
-                )
-                subprocess.run(cmd, capture_output=True, stdin=subprocess.DEVNULL)
-
-                print("  → Resetting slave configuration...")
-                cmd = (
-                    ["mysql"] + self.get_mysql_connection_args() + ["-e", "RESET SLAVE ALL;"]
-                )
-                subprocess.run(cmd, capture_output=True, stdin=subprocess.DEVNULL)
-
-                # Configure slave
-                print("  → Configuring master connection...")
-                change_master_sql = f"""
-                CHANGE MASTER TO
-                    MASTER_HOST='{master_host}',
-                    MASTER_USER='{master_user}',
-                    MASTER_PASSWORD='{master_password}',
-                    MASTER_PORT={master_port},
-                    MASTER_LOG_FILE='{master_status['binlog_file']}',
-                    MASTER_LOG_POS={master_status['binlog_position']};
-                """
-
-                cmd = (
-                    ["mysql"]
-                    + self.get_mysql_connection_args()
-                    + ["-e", change_master_sql]
-                )
-                result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
-
-                if result.returncode != 0:
-                    print(f"ERROR: Failed to configure slave: {result.stderr}")
-                    print("\nTroubleshooting tips:")
-                    print("  1. Check MariaDB error log: journalctl -u mariadb -n 50")
-                    print("  2. Verify master server is accessible")
-                    print("  3. Verify master user has REPLICATION SLAVE privilege")
-                    return False
-
-                # Start slave
-                print("  → Starting slave replication...")
-                cmd = (
-                    ["mysql"]
-                    + self.get_mysql_connection_args()
-                    + ["-e", "START SLAVE;"]
-                )
-                result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
-
-                if result.returncode != 0:
-                    print(f"ERROR: Failed to start slave: {result.stderr}")
-                    return False
-
-                # Check slave status
-                print("  → Checking slave status...")
-                cmd = (
-                    ["mysql"]
-                    + self.get_mysql_connection_args()
-                    + ["-e", "SHOW SLAVE STATUS\\G"]
-                )
-                result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
-
-                print("✓ Slave replication configured")
-                print("\nSlave Status:")
-                print(result.stdout)
-
-            except Exception as e:
-                print(f"ERROR: Slave configuration failed: {e}")
-                return False
-        else:
-            print("\n[4/4] Skipping replication configuration")
-
-        print(f"\n{'='*60}")
-        print("Restore completed successfully!")
-        print(f"{'='*60}\n")
-        return True
+            if protected_restore and protected_state is not None:
+                print("\nRestoring protected restore settings...")
+                self._disable_protected_restore(protected_state)
+                print("✓ Protected restore settings restored")
 
     def configure_settings(self):
         """Interactive configuration menu"""
@@ -1823,7 +2149,33 @@ class MariaDBManager:
                         try:
                             idx = int(input("\nEnter backup number to restore: ")) - 1
                             if 0 <= idx < len(backups):
-                                self.restore_backup(backups[idx]["path"])
+                                print("\nSelect restore mode:")
+                                print("  1. full (databases + users/grants)")
+                                print("  2. users-grants (users/grants only)")
+                                print("  3. databases (schema + data + routines/functions/events/triggers/sequences)")
+                                print("  4. schema (objects only; no row data)")
+                                print("  5. data (row data only)")
+                                mode_choice = input("\nSelect mode [1]: ").strip() or "1"
+                                mode_map = {
+                                    "1": "full",
+                                    "2": "users-grants",
+                                    "3": "databases",
+                                    "4": "schema",
+                                    "5": "data",
+                                }
+                                restore_mode = mode_map.get(mode_choice)
+                                if not restore_mode:
+                                    print("Invalid restore mode")
+                                    continue
+
+                                protected_choice = input("Use protected restore mode? (yes/no) [yes]: ").strip().lower()
+                                protected_restore = protected_choice in {"", "y", "yes"}
+
+                                self.restore_backup(
+                                    backups[idx]["path"],
+                                    restore_mode=restore_mode,
+                                    protected_restore=protected_restore,
+                                )
                             else:
                                 print("Invalid backup number")
                         except ValueError:
@@ -1849,6 +2201,28 @@ class MariaDBManager:
                         try:
                             idx = int(input("\nEnter backup number to restore: ")) - 1
                             if 0 <= idx < len(backups):
+                                print("\nSelect restore mode:")
+                                print("  1. full (databases + users/grants)")
+                                print("  2. users-grants (users/grants only)")
+                                print("  3. databases (schema + data + routines/functions/events/triggers/sequences)")
+                                print("  4. schema (objects only; no row data)")
+                                print("  5. data (row data only)")
+                                mode_choice = input("\nSelect mode [1]: ").strip() or "1"
+                                mode_map = {
+                                    "1": "full",
+                                    "2": "users-grants",
+                                    "3": "databases",
+                                    "4": "schema",
+                                    "5": "data",
+                                }
+                                restore_mode = mode_map.get(mode_choice)
+                                if not restore_mode:
+                                    print("Invalid restore mode")
+                                    continue
+
+                                protected_choice = input("Use protected restore mode? (yes/no) [yes]: ").strip().lower()
+                                protected_restore = protected_choice in {"", "y", "yes"}
+
                                 # Check if config has replication settings
                                 has_config = self.config.has_section('replication')
                                 config_host = self.config['replication'].get('master_host', '') if has_config else ''
@@ -1890,6 +2264,8 @@ class MariaDBManager:
                                     master_user=master_user,
                                     master_password=master_password,
                                     master_port=master_port,
+                                    restore_mode=restore_mode,
+                                    protected_restore=protected_restore,
                                 )
                             else:
                                 print("Invalid backup number")
@@ -1940,6 +2316,15 @@ Examples:
   
   # Restore as master/standalone
   %(prog)s --restore /path/to/backup
+
+    # Restore without protection mode (not recommended)
+    %(prog)s --restore /path/to/backup --unprotected-restore
+
+    # Restore users and grants only
+    %(prog)s --restore /path/to/backup --restore-mode users-grants
+
+    # Restore DB schema objects only (tables/views/procs/functions/events/triggers/sequences)
+    %(prog)s --restore /path/to/backup --restore-mode schema
   
   # Restore as slave (with config file settings)
   %(prog)s --restore /path/to/backup --slave
@@ -1980,6 +2365,17 @@ Examples:
         "--restore", "-r", metavar="PATH", help="Restore backup from path"
     )
     parser.add_argument(
+        "--restore-mode",
+        choices=["full", "users-grants", "databases", "schema", "data"],
+        default="full",
+        help="Restore scope: full, users-grants, databases, schema, or data (default: full)",
+    )
+    parser.add_argument(
+        "--unprotected-restore",
+        action="store_true",
+        help="Disable protected restore mode (default keeps server read-only and event scheduler off during restore)",
+    )
+    parser.add_argument(
         "--slave", "-s", action="store_true", help="Configure as slave (with --restore)"
     )
     parser.add_argument("--master-host", help="Master host for slave setup")
@@ -2009,6 +2405,8 @@ Examples:
             master_user=args.master_user,
             master_password=args.master_password,
             master_port=args.master_port if hasattr(args, 'master_port') else None,
+            restore_mode=args.restore_mode,
+            protected_restore=not args.unprotected_restore,
         )
         sys.exit(0 if success else 1)
 

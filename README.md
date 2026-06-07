@@ -108,6 +108,36 @@ Or with custom config:
 ./mariadb_manager.py --restore /var/backups/mariadb/daily/backup_20260122
 ```
 
+By default, restore runs in **protected mode**:
+- Sets global `read_only=ON` during restore (blocks normal writes)
+- Sets global `event_scheduler=OFF` during restore
+- Restores previous settings automatically when restore exits
+
+To disable this (not recommended):
+
+```bash
+./mariadb_manager.py --restore /var/backups/mariadb/daily/backup_20260122 --unprotected-restore
+```
+
+**Restore Mode Selection (targeted restore):**
+
+```bash
+# Full restore (default): databases + users/grants
+./mariadb_manager.py --restore /var/backups/mariadb/daily/backup_20260122 --restore-mode full
+
+# Users/grants only
+./mariadb_manager.py --restore /var/backups/mariadb/daily/backup_20260122 --restore-mode users-grants
+
+# Databases only: schema + data + routines/functions/events/triggers/sequences
+./mariadb_manager.py --restore /var/backups/mariadb/daily/backup_20260122 --restore-mode databases
+
+# Schema objects only: tables/views/routines/functions/events/triggers/sequences (no row data)
+./mariadb_manager.py --restore /var/backups/mariadb/daily/backup_20260122 --restore-mode schema
+
+# Data rows only (INSERT statements)
+./mariadb_manager.py --restore /var/backups/mariadb/daily/backup_20260122 --restore-mode data
+```
+
 **Restore as Slave (with automatic replication setup):**
 
 ```bash
@@ -115,7 +145,8 @@ Or with custom config:
   --slave \
   --master-host 192.168.1.100 \
   --master-user replication_user \
-  --master-password replication_password
+   --master-password replication_password \
+   --restore-mode full
 ```
 
 ## Cron Job Setup
