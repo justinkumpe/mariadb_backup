@@ -420,6 +420,40 @@ class MariaDBManager:
                     f"WARNING: Failed to restore read_only={desired}: {err or 'unknown error'}"
                 )
 
+    def _detect_mariadb_service_name(self):
+        """Detect MariaDB/MySQL service name for systemctl environments."""
+        candidates = ["mariadb", "mysql"]
+        for service in candidates:
+            cmd = ["systemctl", "status", service]
+            result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+            if result.returncode == 0:
+                return service
+
+        return None
+
+    def _restart_mariadb_service(self):
+        """Best-effort restart of MariaDB service to clear transient global state."""
+        if not shutil.which("systemctl"):
+            print("WARNING: systemctl not found; skipping MariaDB restart")
+            return False
+
+        service = self._detect_mariadb_service_name()
+        if not service:
+            print("WARNING: Could not detect MariaDB/MySQL systemd service; skipping restart")
+            return False
+
+        print(f"Restarting service '{service}' to ensure clean post-restore state...")
+        cmd = ["systemctl", "restart", service]
+        result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        if result.returncode != 0:
+            print(
+                f"WARNING: Failed to restart {service}: {result.stderr.strip() if result.stderr else 'unknown error'}"
+            )
+            return False
+
+        print(f"✓ Service '{service}' restarted")
+        return True
+
     def _run_restore_from_file(self, sql_file):
         """Run mysql restore from an existing SQL file path."""
         with open(sql_file, "r") as f:
@@ -1468,6 +1502,7 @@ class MariaDBManager:
         restore_mode="full",
         protected_restore=True,
         drop_non_system_databases=False,
+        restart_after_restore=True,
     ):
         """
         Restore a backup
@@ -1482,6 +1517,7 @@ class MariaDBManager:
             restore_mode: What to restore: full, users-grants, databases, schema, data
             protected_restore: Enable restore safety mode (read_only ON, event_scheduler OFF)
             drop_non_system_databases: Drop non-system schemas before restore (destructive)
+            restart_after_restore: Restart MariaDB service after restore (recommended safety reset)
         """
         print(f"\n{'='*60}")
         print(f"Restoring Backup")
@@ -1546,6 +1582,9 @@ class MariaDBManager:
         print(f"   Protected restore: {'ENABLED' if protected_restore else 'DISABLED'}")
         print(
             f"   Drop non-system DBs first: {'YES' if drop_non_system_databases else 'NO'}"
+        )
+        print(
+            f"   Restart MariaDB after restore: {'YES' if restart_after_restore else 'NO'}"
         )
 
         if restore_as_slave:
@@ -1821,6 +1860,10 @@ class MariaDBManager:
                 print("\nRestoring protected restore settings...")
                 self._disable_protected_restore(protected_state)
                 print("✓ Protected restore settings restored")
+
+            if restart_after_restore:
+                print("\nApplying final safety reset: restarting MariaDB service...")
+                self._restart_mariadb_service()
 
     def configure_settings(self):
         """Interactive configuration menu"""
@@ -2463,6 +2506,9 @@ Examples:
     # Destructive restore prep: drop non-system databases first
     %(prog)s --restore /path/to/backup --drop-non-system-databases
 
+    # Skip automatic post-restore service restart
+    %(prog)s --restore /path/to/backup --no-restart-after-restore
+
     # Restore users and grants only
     %(prog)s --restore /path/to/backup --restore-mode users-grants
 
@@ -2524,6 +2570,11 @@ Examples:
         help="Drop all non-system databases before restore (destructive)",
     )
     parser.add_argument(
+        "--no-restart-after-restore",
+        action="store_true",
+        help="Do not restart MariaDB service after restore (default is to restart for safety)",
+    )
+    parser.add_argument(
         "--slave", "-s", action="store_true", help="Configure as slave (with --restore)"
     )
     parser.add_argument("--master-host", help="Master host for slave setup")
@@ -2556,6 +2607,7 @@ Examples:
             restore_mode=args.restore_mode,
             protected_restore=not args.unprotected_restore,
             drop_non_system_databases=args.drop_non_system_databases,
+            restart_after_restore=not args.no_restart_after_restore,
         )
         sys.exit(0 if success else 1)
 

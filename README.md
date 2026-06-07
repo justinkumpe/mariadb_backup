@@ -136,6 +136,7 @@ By default, restore runs in **protected mode**:
 - Sets global `read_only=ON` during restore (blocks normal writes)
 - Sets global `event_scheduler=OFF` during restore
 - Restores previous settings automatically when restore exits
+- Restarts MariaDB service after restore to ensure global state is fully reset
 
 Note: privileged users may still be able to write during restore on some MariaDB setups.
 
@@ -143,6 +144,12 @@ To disable this (not recommended):
 
 ```bash
 ./mariadb_manager.py --restore /var/backups/mariadb/daily/backup_20260122 --unprotected-restore
+```
+
+To skip the post-restore MariaDB restart:
+
+```bash
+./mariadb_manager.py --restore /var/backups/mariadb/daily/backup_20260122 --no-restart-after-restore
 ```
 
 To run a destructive pre-clean (drop all non-system databases before restore):
