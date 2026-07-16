@@ -12,6 +12,7 @@ import datetime
 import getpass
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -420,13 +421,42 @@ class MariaDBManager:
                     f"WARNING: Failed to restore read_only={desired}: {err or 'unknown error'}"
                 )
 
+    def _mysql_client_bin(self):
+        """Prefer mariadb client when available, fall back to mysql."""
+        for cmd in ("mariadb", "mysql"):
+            if shutil.which(cmd):
+                return cmd
+        return "mysql"
+
     def _detect_mariadb_service_name(self):
-        """Detect MariaDB/MySQL service name for systemctl environments."""
+        """Detect MariaDB/MySQL service name even when the unit is failed/inactive."""
+        if not shutil.which("systemctl"):
+            return None
+
         candidates = ["mariadb", "mysql"]
         for service in candidates:
-            cmd = ["systemctl", "status", service]
-            result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
-            if result.returncode == 0:
+            # is-active returns 0 only when active; still useful for identity.
+            _, active_out, _ = self._run_systemctl("is-active", service)
+            if active_out in {"active", "activating", "reloading"}:
+                return service
+
+            # Unit exists when is-enabled returns enabled/disabled/static/etc (not "not-found").
+            _, enabled_out, _ = self._run_systemctl("is-enabled", service)
+            if enabled_out and enabled_out not in {"not-found", "unknown"}:
+                return service
+
+            # Fallback: status exit 0 (active) or 3 (inactive/dead) means unit exists.
+            status = subprocess.run(
+                ["systemctl", "status", service],
+                capture_output=True,
+                text=True,
+                stdin=subprocess.DEVNULL,
+            )
+            if status.returncode in {0, 3}:
+                return service
+            # Failed units often return 1/4 but still exist.
+            combined = f"{status.stdout or ''}\n{status.stderr or ''}".lower()
+            if f"{service}.service" in combined or "loaded:" in combined:
                 return service
 
         return None
@@ -443,15 +473,756 @@ class MariaDBManager:
             return False
 
         print(f"Restarting service '{service}' to ensure clean post-restore state...")
-        cmd = ["systemctl", "restart", service]
-        result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
-        if result.returncode != 0:
+        ok, _, stderr = self._run_systemctl("restart", service)
+        if not ok:
             print(
-                f"WARNING: Failed to restart {service}: {result.stderr.strip() if result.stderr else 'unknown error'}"
+                f"WARNING: Failed to restart {service}: {stderr or 'unknown error'}"
             )
             return False
 
         print(f"✓ Service '{service}' restarted")
+        return True
+
+    def _is_effective_root(self):
+        """Return True when running with privileges needed for service/datadir operations."""
+        return hasattr(os, "geteuid") and os.geteuid() == 0
+
+    def _run_systemctl(self, action, service):
+        """Run a systemctl action and return (success, stdout, stderr)."""
+        if not shutil.which("systemctl"):
+            return False, "", "systemctl not found"
+        cmd = ["systemctl", action, service]
+        result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        return result.returncode == 0, (result.stdout or "").strip(), (result.stderr or "").strip()
+
+    def _get_mariadb_service_status(self):
+        """Return systemd status details for MariaDB/MySQL, or None if unavailable."""
+        service = self._detect_mariadb_service_name()
+        if not service:
+            return None
+
+        _, active_out, _ = self._run_systemctl("is-active", service)
+        _, enabled_out, _ = self._run_systemctl("is-enabled", service)
+        active_out = active_out or "unknown"
+        enabled_out = enabled_out or "unknown"
+        return {
+            "service": service,
+            "active": active_out,
+            "enabled": enabled_out,
+            "running": active_out == "active",
+        }
+
+    def _get_service_journal_tail(self, service, lines=30):
+        """Return recent journal lines for a systemd service."""
+        if not shutil.which("journalctl"):
+            return ""
+        cmd = ["journalctl", "-u", service, "-n", str(lines), "--no-pager"]
+        result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        if result.returncode != 0:
+            return result.stderr.strip() if result.stderr else ""
+        return result.stdout.strip()
+
+    def _stop_mariadb_service(self):
+        """Stop MariaDB/MySQL systemd service. Already-stopped is success."""
+        service = self._detect_mariadb_service_name()
+        if not service:
+            print("ERROR: Could not detect MariaDB/MySQL systemd service")
+            return False
+
+        status = self._get_mariadb_service_status()
+        if status and not status["running"] and status["active"] in {"inactive", "dead", "failed"}:
+            print(f"Service '{service}' already stopped ({status['active']})")
+            # Clear failed state so a later start can succeed.
+            self._run_systemctl("reset-failed", service)
+            return True
+
+        print(f"Stopping service '{service}'...")
+        ok, _, stderr = self._run_systemctl("stop", service)
+        if not ok:
+            # Treat already inactive as success.
+            _, active_out, _ = self._run_systemctl("is-active", service)
+            if active_out in {"inactive", "dead", "failed"}:
+                self._run_systemctl("reset-failed", service)
+                print(f"✓ Service '{service}' is stopped")
+                return True
+            print(f"ERROR: Failed to stop {service}: {stderr or 'unknown error'}")
+            return False
+
+        print(f"✓ Service '{service}' stopped")
+        return True
+
+    def _start_mariadb_service(self, wait_seconds=30):
+        """Start MariaDB/MySQL systemd service and wait for readiness."""
+        service = self._detect_mariadb_service_name()
+        if not service:
+            print("ERROR: Could not detect MariaDB/MySQL systemd service")
+            return False
+
+        self._run_systemctl("reset-failed", service)
+        print(f"Starting service '{service}'...")
+        ok, _, stderr = self._run_systemctl("start", service)
+        if not ok:
+            print(f"ERROR: Failed to start {service}: {stderr or 'unknown error'}")
+            journal = self._get_service_journal_tail(service, lines=40)
+            if journal:
+                print("Recent service log:")
+                print(journal[-3000:])
+            return False
+
+        ping_bins = []
+        if shutil.which("mariadb-admin"):
+            ping_bins.append("mariadb-admin")
+        if shutil.which("mysqladmin"):
+            ping_bins.append("mysqladmin")
+
+        if ping_bins:
+            for _ in range(wait_seconds):
+                for ping_bin in ping_bins:
+                    ping = subprocess.run(
+                        [ping_bin, "ping", "--silent"],
+                        capture_output=True,
+                        text=True,
+                        stdin=subprocess.DEVNULL,
+                    )
+                    if ping.returncode == 0:
+                        print(f"✓ Service '{service}' is ready")
+                        return True
+                # Also accept a successful SELECT via socket once the sock appears.
+                if self._probe_connection(quiet=True) or self._can_connect_root_socket():
+                    print(f"✓ Service '{service}' is ready")
+                    return True
+                time.sleep(1)
+            print(
+                f"WARNING: Service '{service}' started but readiness check did not succeed "
+                f"within {wait_seconds} seconds"
+            )
+            return False
+
+        # No admin ping tool; fall back to client probe.
+        for _ in range(wait_seconds):
+            if self._probe_connection(quiet=True) or self._can_connect_root_socket():
+                print(f"✓ Service '{service}' is ready")
+                return True
+            time.sleep(1)
+
+        print(f"WARNING: Service '{service}' start command completed; readiness uncertain")
+        return True
+
+    def _parse_datadir_from_cnf(self, path):
+        """Parse datadir from a MariaDB/MySQL config file."""
+        parser = configparser.ConfigParser()
+        try:
+            # MariaDB cnf files may lack section headers; tolerate that.
+            with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+                content = handle.read()
+            if not re.search(r"^\s*\[[^\]]+\]", content, flags=re.M):
+                content = "[mysqld]\n" + content
+            parser.read_string(content)
+        except (configparser.Error, OSError):
+            return None
+
+        for section in parser.sections():
+            if parser.has_option(section, "datadir"):
+                value = parser.get(section, "datadir").strip()
+                if value:
+                    return value
+        return None
+
+    def _detect_datadir(self):
+        """Best-effort detection of MariaDB datadir path."""
+        for cmd_name in ("mysqld", "mariadbd"):
+            if not shutil.which(cmd_name):
+                continue
+            try:
+                result = subprocess.run(
+                    [cmd_name, "--verbose", "--help"],
+                    capture_output=True,
+                    text=True,
+                    stdin=subprocess.DEVNULL,
+                    timeout=30,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            for line in (result.stdout + result.stderr).splitlines():
+                stripped = line.strip()
+                if stripped.startswith("datadir"):
+                    parts = stripped.split(None, 1)
+                    if len(parts) == 2 and parts[1]:
+                        return parts[1].strip()
+
+        cnf_paths = [
+            "/etc/mysql/mariadb.conf.d/50-server.cnf",
+            "/etc/mysql/my.cnf",
+            "/etc/my.cnf",
+        ]
+        for path in cnf_paths:
+            if os.path.exists(path):
+                datadir = self._parse_datadir_from_cnf(path)
+                if datadir:
+                    return datadir
+
+        return "/var/lib/mysql"
+
+    def _find_install_db_command(self):
+        """Locate mariadb-install-db or mysql_install_db."""
+        for cmd in ("mariadb-install-db", "mysql_install_db"):
+            if shutil.which(cmd):
+                return cmd
+        return None
+
+    def _find_server_bin(self):
+        """Locate mysqld/mariadbd binary for bootstrap recovery."""
+        for cmd in ("mariadbd", "mysqld"):
+            if shutil.which(cmd):
+                return cmd
+        return None
+
+    def _get_mysql_unix_account(self):
+        """Return (user, group) for datadir ownership, defaulting to mysql."""
+        try:
+            import pwd
+
+            entry = pwd.getpwnam("mysql")
+            return entry.pw_name, entry.pw_name
+        except (ImportError, KeyError):
+            return "mysql", "mysql"
+
+    def _sql_escape_string(self, value):
+        """Escape a value for use inside single-quoted SQL string literals."""
+        return value.replace("\\", "\\\\").replace("'", "''")
+
+    def _find_mysql_socket(self):
+        """Return first existing MySQL/MariaDB unix socket path."""
+        socket_locations = [
+            "/run/mysqld/mysqld.sock",
+            "/var/run/mysqld/mysqld.sock",
+            "/var/lib/mysql/mysql.sock",
+            "/tmp/mysql.sock",
+            "/run/mysql/mysql.sock",
+        ]
+        for sock in socket_locations:
+            if os.path.exists(sock):
+                return sock
+        return None
+
+    def _run_mysql_cli(self, sql, user="root", password=None, socket_path=None, use_config_creds=False):
+        """Run SQL via mysql/mariadb client. Returns (ok, stdout, stderr)."""
+        client = self._mysql_client_bin()
+        cmd = [client, "--no-defaults", "-N", "-B", "-e", sql]
+        env = os.environ.copy()
+
+        if use_config_creds:
+            cmd.extend(self.get_mysql_connection_args())
+            password = self.config["mysql"].get("password", "")
+        else:
+            cmd.append(f"--user={user}")
+            if socket_path:
+                cmd.append(f"--socket={socket_path}")
+            elif self.config["mysql"].get("host", "localhost").lower() != "localhost":
+                cmd.append(f"--host={self.config['mysql']['host']}")
+                cmd.append(f"--port={self.config['mysql']['port']}")
+
+        cmd_without_pwd = [arg for arg in cmd if not arg.startswith("--password=")]
+        if password:
+            env["MYSQL_PWD"] = password
+
+        result = subprocess.run(
+            cmd_without_pwd,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            env=env,
+            timeout=20,
+        )
+        return result.returncode == 0, (result.stdout or "").strip(), (result.stderr or "").strip()
+
+    def _run_mysql_root_socket(self, sql):
+        """Run SQL as local root via Unix socket (no config password)."""
+        socket_path = self._find_mysql_socket()
+        return self._run_mysql_cli(sql, user="root", password=None, socket_path=socket_path)
+
+    def _can_connect_root_socket(self):
+        """Return True when OS root can connect to MariaDB via local socket."""
+        ok, _, _ = self._run_mysql_root_socket("SELECT 1;")
+        return ok
+
+    def _probe_connection(self, quiet=True):
+        """Quiet connection probe using config credentials."""
+        try:
+            ok, _, stderr = self._run_mysql_cli("SELECT 1;", use_config_creds=True)
+            if not quiet and not ok and stderr:
+                password = self.config["mysql"].get("password", "")
+                if password:
+                    stderr = stderr.replace(password, "***")
+                print(f"Connection probe failed: {stderr}")
+            return ok
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+
+    def _diagnose_mariadb(self):
+        """Collect MariaDB health details for disaster recovery decisions."""
+        status = self._get_mariadb_service_status()
+        datadir = self._detect_datadir()
+        mysql_dir = os.path.join(datadir, "mysql") if datadir else None
+        socket_path = self._find_mysql_socket()
+
+        diagnosis = {
+            "service": status["service"] if status else None,
+            "service_running": bool(status and status["running"]),
+            "service_active": status["active"] if status else "unknown",
+            "datadir": datadir,
+            "mysql_system_dir": mysql_dir,
+            "mysql_system_dir_exists": bool(mysql_dir and os.path.isdir(mysql_dir)),
+            "socket_path": socket_path,
+            "connection_ok": self._probe_connection(quiet=True),
+            "root_socket_ok": self._can_connect_root_socket() if self._is_effective_root() else False,
+            "journal_tail": "",
+        }
+
+        if status and status["service"]:
+            diagnosis["journal_tail"] = self._get_service_journal_tail(status["service"])
+
+        return diagnosis
+
+    def _backup_mysql_system_tables(self, datadir):
+        """Backup mysql system schema directory before destructive recovery."""
+        mysql_dir = os.path.join(datadir, "mysql")
+        if not os.path.isdir(mysql_dir):
+            print(f"WARNING: mysql system directory not found at {mysql_dir}; skipping backup")
+            return None
+
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_dir = os.path.join(datadir, f"mysql_system_backup_{timestamp}")
+        print(f"Backing up {mysql_dir} -> {backup_dir}")
+        shutil.copytree(mysql_dir, backup_dir)
+        print(f"✓ mysql system tables backed up to {backup_dir}")
+        return backup_dir
+
+    def _remove_mysql_system_table_files(self, datadir):
+        """Remove mysql system schema files while preserving application databases."""
+        mysql_dir = os.path.join(datadir, "mysql")
+        if os.path.isdir(mysql_dir):
+            print(f"Removing corrupted mysql system files in {mysql_dir}")
+            shutil.rmtree(mysql_dir)
+
+        os.makedirs(mysql_dir, exist_ok=True)
+        user, group = self._get_mysql_unix_account()
+        try:
+            shutil.chown(mysql_dir, user, group)
+        except (LookupError, PermissionError, OSError) as exc:
+            print(f"WARNING: Could not chown {mysql_dir} to {user}:{group}: {exc}")
+
+        print(f"✓ mysql system directory reset at {mysql_dir}")
+        return True
+
+    def _run_install_db(self, datadir):
+        """Reinitialize MariaDB system tables in an existing datadir."""
+        install_cmd = self._find_install_db_command()
+        if not install_cmd:
+            print("ERROR: mariadb-install-db/mysql_install_db not found")
+            return False
+
+        user, _ = self._get_mysql_unix_account()
+        cmd = [install_cmd, f"--user={user}", f"--datadir={datadir}"]
+        print(f"Running {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        if result.returncode != 0:
+            output = (result.stderr or result.stdout or "").strip()
+            print(f"ERROR: {install_cmd} failed: {output or 'unknown error'}")
+            return False
+
+        print(f"✓ {install_cmd} completed successfully")
+        return True
+
+    def _configure_restore_access(self, admin_user, admin_password, admin_host="localhost", root_password=None):
+        """Create or update restore admin credentials using local root socket access."""
+        user_esc = self._sql_escape_string(admin_user)
+        host_esc = self._sql_escape_string(admin_host)
+        pass_esc = self._sql_escape_string(admin_password)
+
+        statements = [
+            f"CREATE USER IF NOT EXISTS '{user_esc}'@'{host_esc}' IDENTIFIED BY '{pass_esc}';",
+            f"ALTER USER '{user_esc}'@'{host_esc}' IDENTIFIED BY '{pass_esc}';",
+            f"GRANT ALL PRIVILEGES ON *.* TO '{user_esc}'@'{host_esc}' WITH GRANT OPTION;",
+            "FLUSH PRIVILEGES;",
+        ]
+
+        if root_password:
+            root_esc = self._sql_escape_string(root_password)
+            statements.insert(
+                0,
+                f"ALTER USER 'root'@'localhost' IDENTIFIED BY '{root_esc}';",
+            )
+
+        sql = "\n".join(statements)
+        ok, _, stderr = self._run_mysql_root_socket(sql)
+        if not ok:
+            print(f"ERROR: Failed to configure restore access: {stderr or 'unknown error'}")
+            return False
+
+        print(f"✓ Restore user '{admin_user}'@'{admin_host}' configured")
+        return True
+
+    def _wait_for_socket(self, timeout_seconds=30):
+        """Wait for unix socket to appear."""
+        for _ in range(timeout_seconds):
+            sock = self._find_mysql_socket()
+            if sock:
+                return sock
+            time.sleep(1)
+        return None
+
+    def _bootstrap_with_skip_grant_tables(self, admin_user, admin_password, admin_host="localhost", root_password=None):
+        """Start temporary mysqld with --skip-grant-tables to repair credentials."""
+        if not self._is_effective_root():
+            print("ERROR: skip-grant-tables recovery requires root privileges (use sudo).")
+            return False
+
+        server_bin = self._find_server_bin()
+        if not server_bin:
+            print("ERROR: mysqld/mariadbd not found for skip-grant-tables recovery")
+            return False
+
+        datadir = self._detect_datadir()
+        user, _ = self._get_mysql_unix_account()
+
+        print("Attempting skip-grant-tables bootstrap to restore admin access...")
+        if not self._stop_mariadb_service():
+            return False
+
+        cmd = [
+            server_bin,
+            f"--user={user}",
+            f"--datadir={datadir}",
+            "--skip-grant-tables",
+            "--skip-networking",
+            "--socket=/tmp/mariadb_dr.sock",
+        ]
+        print(f"Starting temporary server: {' '.join(cmd)}")
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+        try:
+            sock = None
+            for _ in range(30):
+                if os.path.exists("/tmp/mariadb_dr.sock"):
+                    sock = "/tmp/mariadb_dr.sock"
+                    break
+                if proc.poll() is not None:
+                    err = (proc.stderr.read() if proc.stderr else "") or ""
+                    print(f"ERROR: Temporary server exited early: {err[-2000:]}")
+                    return False
+                time.sleep(1)
+
+            if not sock:
+                print("ERROR: Temporary skip-grant-tables socket did not appear")
+                return False
+
+            # With skip-grant-tables, FLUSH PRIVILEGES is required before ALTER USER on some versions.
+            bootstrap_sql = "FLUSH PRIVILEGES;\n"
+            user_esc = self._sql_escape_string(admin_user)
+            host_esc = self._sql_escape_string(admin_host)
+            pass_esc = self._sql_escape_string(admin_password)
+            bootstrap_sql += (
+                f"CREATE USER IF NOT EXISTS '{user_esc}'@'{host_esc}' IDENTIFIED BY '{pass_esc}';\n"
+                f"ALTER USER '{user_esc}'@'{host_esc}' IDENTIFIED BY '{pass_esc}';\n"
+                f"GRANT ALL PRIVILEGES ON *.* TO '{user_esc}'@'{host_esc}' WITH GRANT OPTION;\n"
+            )
+            if root_password:
+                root_esc = self._sql_escape_string(root_password)
+                bootstrap_sql += f"ALTER USER 'root'@'localhost' IDENTIFIED BY '{root_esc}';\n"
+            bootstrap_sql += "FLUSH PRIVILEGES;"
+
+            ok, _, stderr = self._run_mysql_cli(
+                bootstrap_sql, user="root", password=None, socket_path=sock
+            )
+            if not ok:
+                print(f"ERROR: skip-grant-tables credential repair failed: {stderr or 'unknown error'}")
+                return False
+
+            print("✓ Credentials repaired via skip-grant-tables")
+            return True
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
+            if os.path.exists("/tmp/mariadb_dr.sock"):
+                try:
+                    os.remove("/tmp/mariadb_dr.sock")
+                except OSError:
+                    pass
+            # Bring normal service back up.
+            self._start_mariadb_service()
+
+    def _update_config_mysql_credentials(self, user, password, host=None, port=None):
+        """Persist MySQL credentials used by restore operations."""
+        self.config.set("mysql", "user", user)
+        self.config.set("mysql", "password", password)
+        if host is not None:
+            self.config.set("mysql", "host", host)
+        if port is not None:
+            self.config.set("mysql", "port", str(port))
+        return self.save_config()
+
+    def _reset_mysql_system_tables(self, datadir, backup=True):
+        """Stop MariaDB, reset mysql system schema files, and reinitialize system tables."""
+        if not self._is_effective_root():
+            print("ERROR: Resetting mysql system tables requires root privileges (use sudo).")
+            return False
+
+        if backup:
+            self._backup_mysql_system_tables(datadir)
+
+        if not self._stop_mariadb_service():
+            return False
+
+        if not self._remove_mysql_system_table_files(datadir):
+            return False
+
+        if not self._run_install_db(datadir):
+            return False
+
+        return self._start_mariadb_service()
+
+    def disaster_recovery(
+        self,
+        reset_system_tables=False,
+        admin_user=None,
+        admin_password=None,
+        admin_host="localhost",
+        root_password=None,
+        skip_confirm=False,
+        restore_path=None,
+        restore_as_slave=False,
+        restore_mode="full",
+        protected_restore=True,
+        drop_non_system_databases=False,
+        restart_after_restore=True,
+    ):
+        """
+        Disaster recovery workflow for servers where MariaDB will not start or credentials are broken.
+
+        Steps:
+        1. Diagnose service status, logs, datadir, and connectivity (quiet)
+        2. Try start service; if still unhealthy, reset mysql system tables / skip-grant-tables
+        3. Configure restore admin user (reuse config password when present)
+        4. Optionally restore from a backup path
+        """
+        print(f"\n{'='*60}")
+        print("Disaster Recovery Mode")
+        print(f"{'='*60}\n")
+
+        if not self._is_effective_root():
+            print(
+                "WARNING: Not running as root. Service control and mysql system table reset "
+                "require sudo/root."
+            )
+
+        diagnosis = self._diagnose_mariadb()
+        service = diagnosis["service"] or "mariadb/mysql"
+        datadir = diagnosis["datadir"]
+
+        print("Diagnosis:")
+        print(f"  Service: {service}")
+        print(f"  Service running: {'yes' if diagnosis['service_running'] else 'no'} ({diagnosis['service_active']})")
+        print(f"  Datadir: {datadir}")
+        print(
+            f"  mysql system dir: {diagnosis['mysql_system_dir']} "
+            f"({'present' if diagnosis['mysql_system_dir_exists'] else 'missing'})"
+        )
+        print(f"  Socket: {diagnosis.get('socket_path') or 'not found'}")
+        print(f"  Config credentials work: {'yes' if diagnosis['connection_ok'] else 'no'}")
+        if self._is_effective_root():
+            print(f"  Root socket login works: {'yes' if diagnosis['root_socket_ok'] else 'no'}")
+
+        if diagnosis.get("journal_tail") and not diagnosis["service_running"]:
+            print("\nRecent service log:")
+            print("-" * 60)
+            print(diagnosis["journal_tail"][-3000:])
+            print("-" * 60)
+
+        admin_user = admin_user or self.config["mysql"].get("user") or "restore_admin"
+        admin_host = admin_host or "localhost"
+        config_password = self.config["mysql"].get("password", "").strip()
+
+        if not admin_password:
+            if config_password:
+                admin_password = config_password
+                print(
+                    f"\nUsing existing config password for restore user "
+                    f"'{admin_user}'@'{admin_host}'"
+                )
+            elif skip_confirm:
+                print("ERROR: No password in config; pass --dr-admin-pass for non-interactive mode")
+                return False
+            else:
+                admin_password = getpass.getpass(
+                    f"Enter password for restore user '{admin_user}'@'{admin_host}': "
+                ).strip()
+                if not admin_password:
+                    print("ERROR: Restore user password cannot be empty")
+                    return False
+
+        # If service is down, try a normal start before destructive recovery.
+        if not diagnosis["service_running"] and self._is_effective_root():
+            print("\nService is down — attempting normal start first...")
+            if self._start_mariadb_service():
+                diagnosis = self._diagnose_mariadb()
+            else:
+                print("Normal start failed; continuing with recovery options")
+
+        unhealthy = (
+            not diagnosis["service_running"]
+            or (not diagnosis["connection_ok"] and not diagnosis["root_socket_ok"])
+        )
+
+        needs_system_reset = bool(reset_system_tables)
+        if not needs_system_reset and unhealthy:
+            if skip_confirm:
+                # Disaster recovery should overcome a dead server automatically.
+                needs_system_reset = not diagnosis["service_running"]
+            else:
+                print(
+                    "\nMariaDB is not healthy. You can reset ONLY the mysql system schema files "
+                    "(application database directories are preserved)."
+                )
+                default = "yes" if not diagnosis["service_running"] else "no"
+                answer = input(
+                    f"Reset mysql system tables? (yes/no) [{default}]: "
+                ).strip().lower()
+                if not answer:
+                    answer = default
+                needs_system_reset = answer in {"y", "yes"}
+
+        if needs_system_reset:
+            print("\n⚠️  WARNING: This will stop MariaDB and rebuild mysql system tables.")
+            print(f"   Datadir: {datadir}")
+            print("   Application database directories outside mysql/ are preserved.")
+            if not skip_confirm:
+                answer = input("\nContinue with mysql system table reset? (yes/no): ").strip().lower()
+                if answer != "yes":
+                    print("Disaster recovery cancelled.")
+                    return False
+
+            if not self._reset_mysql_system_tables(datadir, backup=True):
+                print("ERROR: mysql system table reset failed")
+                return False
+
+            diagnosis = self._diagnose_mariadb()
+
+        # If server is up but auth is broken, use skip-grant-tables bootstrap.
+        if (
+            diagnosis["service_running"]
+            and not diagnosis["connection_ok"]
+            and not diagnosis["root_socket_ok"]
+        ):
+            print("\nServer is running but authentication is broken.")
+            do_bootstrap = True
+            if not skip_confirm:
+                answer = input(
+                    "Repair credentials with skip-grant-tables bootstrap? (yes/no) [yes]: "
+                ).strip().lower()
+                do_bootstrap = answer in {"", "y", "yes"}
+            if do_bootstrap:
+                if root_password is None and not skip_confirm:
+                    set_root = input(
+                        "Also set MariaDB root@localhost password during bootstrap? (yes/no) [no]: "
+                    ).strip().lower()
+                    if set_root in {"y", "yes"}:
+                        root_password = getpass.getpass("Enter new root password: ").strip() or None
+
+                if not self._bootstrap_with_skip_grant_tables(
+                    admin_user,
+                    admin_password,
+                    admin_host=admin_host,
+                    root_password=root_password,
+                ):
+                    print("ERROR: skip-grant-tables credential repair failed")
+                    return False
+                diagnosis = self._diagnose_mariadb()
+
+        if not diagnosis["service_running"]:
+            print("ERROR: MariaDB service is still not running after recovery attempts")
+            if diagnosis.get("journal_tail"):
+                print("\nRecent service log:")
+                print(diagnosis["journal_tail"][-3000:])
+            return False
+
+        # After system table reset, root socket usually works; configure restore access.
+        if diagnosis["root_socket_ok"]:
+            if root_password is None and not skip_confirm:
+                set_root = input("Set MariaDB root@localhost password? (yes/no) [no]: ").strip().lower()
+                if set_root in {"y", "yes"}:
+                    root_password = getpass.getpass("Enter new root password: ").strip()
+                    if not root_password:
+                        print("WARNING: Empty root password ignored")
+                        root_password = None
+
+            print("\nConfiguring restore access...")
+            if not self._configure_restore_access(
+                admin_user,
+                admin_password,
+                admin_host=admin_host,
+                root_password=root_password,
+            ):
+                # Last-resort auth repair.
+                print("Root socket configure failed; trying skip-grant-tables fallback...")
+                if not self._bootstrap_with_skip_grant_tables(
+                    admin_user,
+                    admin_password,
+                    admin_host=admin_host,
+                    root_password=root_password,
+                ):
+                    return False
+        elif not diagnosis["connection_ok"]:
+            print("\nNo usable auth path; attempting skip-grant-tables recovery...")
+            if not self._bootstrap_with_skip_grant_tables(
+                admin_user,
+                admin_password,
+                admin_host=admin_host,
+                root_password=root_password,
+            ):
+                return False
+        else:
+            print("\nConfig credentials already work.")
+            if diagnosis["root_socket_ok"]:
+                self._configure_restore_access(
+                    admin_user,
+                    admin_password,
+                    admin_host=admin_host,
+                    root_password=root_password,
+                )
+
+        host = self.config["mysql"].get("host", "localhost")
+        port = self.config["mysql"].get("port", "3306")
+        if not self._update_config_mysql_credentials(admin_user, admin_password, host=host, port=port):
+            print("WARNING: Failed to update config file; restore user may still be configured in MariaDB")
+
+        self.config.set("mysql", "user", admin_user)
+        self.config.set("mysql", "password", admin_password)
+
+        if not self._probe_connection(quiet=False):
+            print("ERROR: Restore user credentials were configured but connection test failed")
+            return False
+
+        print("\n✓ Disaster recovery setup complete")
+        print(f"  Restore user: {admin_user}@{admin_host}")
+        print(f"  Config file: {os.path.abspath(self.config_file)}")
+
+        if restore_path:
+            print("\nProceeding to backup restore...")
+            return self.restore_backup(
+                restore_path,
+                restore_as_slave=restore_as_slave,
+                restore_mode=restore_mode,
+                protected_restore=protected_restore,
+                drop_non_system_databases=drop_non_system_databases,
+                restart_after_restore=restart_after_restore,
+            )
+
         return True
 
     def _run_restore_from_file(self, sql_file):
@@ -2319,6 +3090,8 @@ class MariaDBManager:
             print("  8. Configure Settings")
             print("  9. Test MySQL Connection")
             print(" 10. Manage Backup Schedule (cron)")
+            print("\nDISASTER RECOVERY:")
+            print(" 11. Disaster Recovery Mode (fix server + configure restore access)")
             print("\n  0. Exit")
 
             choice = input("\nSelect option: ").strip()
@@ -2514,6 +3287,19 @@ class MariaDBManager:
             elif choice == "10":
                 self.manage_schedule()
 
+            elif choice == "11":
+                reset_choice = input(
+                    "Reset mysql system tables if needed? (yes/no) [no]: "
+                ).strip().lower()
+                reset_system_tables = reset_choice in {"y", "yes"}
+                restore_path = input(
+                    "Restore from backup path after recovery (optional): "
+                ).strip()
+                self.disaster_recovery(
+                    reset_system_tables=reset_system_tables,
+                    restore_path=restore_path if restore_path else None,
+                )
+
             elif choice == "0":
                 print("\nExiting...")
                 break
@@ -2568,6 +3354,12 @@ Examples:
            --master-user repl_user \\
            --master-password secret \\
            --master-port 3306
+
+  # Disaster recovery when MariaDB will not start
+  sudo %(prog)s --disaster-recovery --dr-admin-pass 'StrongPass123!'
+  sudo %(prog)s --disaster-recovery --reset-mysql-system-tables --dr-admin-pass 'StrongPass123!'
+  sudo %(prog)s --disaster-recovery --dr-admin-pass 'StrongPass123!' \\
+      --restore /path/to/backup --restore-mode full
   
   # Configuration
   %(prog)s --config /path/to/config.conf
@@ -2625,6 +3417,41 @@ Examples:
     parser.add_argument("--master-user", help="Master replication user")
     parser.add_argument("--master-password", help="Master replication password")
     parser.add_argument("--master-port", help="Master port for slave setup (default: 3306)")
+    parser.add_argument(
+        "--disaster-recovery",
+        action="store_true",
+        help="Run disaster recovery workflow (diagnose, optionally reset mysql system tables, configure restore access)",
+    )
+    parser.add_argument(
+        "--reset-mysql-system-tables",
+        action="store_true",
+        help="With --disaster-recovery: reset mysql system schema files and reinitialize system tables",
+    )
+    parser.add_argument(
+        "--dr-admin-user",
+        default=None,
+        help="Restore admin user for disaster recovery (default: config user or restore_admin)",
+    )
+    parser.add_argument(
+        "--dr-admin-pass",
+        default=None,
+        help="Restore admin password for disaster recovery (required for non-interactive mode)",
+    )
+    parser.add_argument(
+        "--dr-admin-host",
+        default="localhost",
+        help="Host part for restore admin user (default: localhost)",
+    )
+    parser.add_argument(
+        "--dr-root-pass",
+        default=None,
+        help="Optional new MariaDB root@localhost password during disaster recovery",
+    )
+    parser.add_argument(
+        "--dr-yes",
+        action="store_true",
+        help="Skip disaster recovery confirmation prompts",
+    )
 
     args = parser.parse_args()
 
@@ -2639,6 +3466,23 @@ Examples:
     elif args.list:
         manager.list_backups(args.type)
         sys.exit(0)
+
+    elif args.disaster_recovery:
+        success = manager.disaster_recovery(
+            reset_system_tables=args.reset_mysql_system_tables,
+            admin_user=args.dr_admin_user,
+            admin_password=args.dr_admin_pass,
+            admin_host=args.dr_admin_host,
+            root_password=args.dr_root_pass,
+            skip_confirm=args.dr_yes,
+            restore_path=args.restore,
+            restore_as_slave=args.slave,
+            restore_mode=args.restore_mode,
+            protected_restore=not args.unprotected_restore,
+            drop_non_system_databases=args.drop_non_system_databases,
+            restart_after_restore=not args.no_restart_after_restore,
+        )
+        sys.exit(0 if success else 1)
 
     elif args.restore:
         success = manager.restore_backup(
